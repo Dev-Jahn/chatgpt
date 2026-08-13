@@ -353,7 +353,10 @@ class DarwinPathTests(unittest.TestCase):
             scripts = {
                 "uname": "#!/bin/sh\nprintf 'Darwin\\n'\n",
                 # CDP down -> the wrapper must try to start Chrome and fail on
-                # the (absent in this sandbox) macOS app-bundle binary.
+                # the missing binary. CHATGPT_CHROME_BIN points into the sandbox:
+                # on a real Mac the app-bundle binary exists, and without the
+                # override this test launches a live Chrome (measured: fresh
+                # profile under the fake HOME, macOS Keychain prompt included).
                 "curl": "#!/bin/sh\nexit 1\n",
                 "lsof": "#!/bin/sh\nexit 1\n",
             }
@@ -365,6 +368,7 @@ class DarwinPathTests(unittest.TestCase):
             env.pop("CHATGPT_MAX_PARALLEL", None)
             env["HOME"] = str(home)
             env["PATH"] = f"{fake_bin}:{env['PATH']}"
+            env["CHATGPT_CHROME_BIN"] = str(home / "Google Chrome.app" / "absent")
             result = subprocess.run(
                 [str(ROOT / "bin" / "chatgpt"), "hello"],
                 env=env,
@@ -374,8 +378,52 @@ class DarwinPathTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 1)
+            self.assertIn("Chrome binary is unavailable", result.stderr)
             self.assertIn("Google Chrome.app", result.stderr)
             self.assertNotIn("VNC", result.stderr)
+
+
+class SpawnUnlockedTests(unittest.TestCase):
+    def test_daemon_releases_both_locks(self):
+        """A spawned daemon must not keep either flock alive once the wrapper's own
+        fds are gone. Regression: `without_locks … &` (0.2.0) forked an outer shell
+        that skipped the closes and held both locks for the daemon's whole life —
+        the daemon's own fd table looked clean, so the assertion must be on lock
+        re-acquisition, not on the daemon's fds."""
+        wrapper = (ROOT / "bin" / "chatgpt").read_text(encoding="utf-8")
+        import re
+
+        helper = re.search(r"^spawn_unlocked\(\) \{.*?^\}", wrapper, re.S | re.M)
+        self.assertIsNotNone(helper, "spawn_unlocked() not found in bin/chatgpt")
+        with tempfile.TemporaryDirectory() as directory:
+            script = "\n".join(
+                [
+                    "set -u",
+                    f'D="{directory}"',
+                    helper.group(0),
+                    'exec {SLOT_FD}>"$D/slot.lock"; flock -n "$SLOT_FD" || exit 90',
+                    'exec {RUN_FD}>"$D/run.lock"; flock -n "$RUN_FD" || exit 91',
+                    "spawn_unlocked sleep 2 > /dev/null 2>&1",
+                    "sleep 0.5",
+                    "exec {SLOT_FD}>&- {RUN_FD}>&-",
+                    'exec {S2}>"$D/slot.lock"; flock -n "$S2" || { echo leaked-slot; exit 92; }',
+                    'exec {R2}>"$D/run.lock"; flock -n "$R2" || { echo leaked-run; exit 93; }',
+                    "echo clean",
+                ]
+            )
+            result = subprocess.run(
+                ["bash", "-c", script], text=True, capture_output=True, timeout=10, check=False
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("clean", result.stdout)
+
+    def test_no_call_site_backgrounds_the_helper(self):
+        """The helper backgrounds internally; a trailing `&` at a call site would
+        re-create the outer-shell fork the 0.2.1 fix removed."""
+        wrapper = (ROOT / "bin" / "chatgpt").read_text(encoding="utf-8")
+        for line in wrapper.replace("\\\n", " ").splitlines():
+            if "spawn_unlocked " in line and not line.lstrip().startswith("#"):
+                self.assertFalse(line.rstrip().endswith("&"), line)
 
 
 if __name__ == "__main__":
