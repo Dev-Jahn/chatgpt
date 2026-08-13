@@ -46,7 +46,7 @@ chatgpt --effort pro --attach context.pdf --max-wait 7200 --out answer.md "quest
 - system `python3` with the `playwright` package
 - `/usr/bin/google-chrome`, TurboVNC (`/opt/TurboVNC/bin/vncserver`),
   `openbox`, `websockify`, noVNC assets
-- an existing logged-in Chrome profile at `~/.insane-review/browser-profile`
+- a logged-in Chrome profile at `~/.chatgpt/browser-profile` (override with `CHATGPT_PROFILE`)
 
 If a Chrome CDP stack is already alive on port 9222 it is reused. Otherwise a
 free VNC display is picked and Chrome CDP + noVNC are started automatically;
