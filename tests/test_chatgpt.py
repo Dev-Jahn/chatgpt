@@ -308,3 +308,11 @@ class WrapperLockTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_rate_limiter_env_defaults():
+    """The submit limiter block exists with the expected defaults and stamp file."""
+    src = open(BIN).read() if 'BIN' in globals() else open(__file__.replace('tests/test_chatgpt.py','bin/chatgpt')).read()
+    assert 'CHATGPT_SUBMIT_GAP_MIN:-8' in src
+    assert 'CHATGPT_SUBMIT_GAP_MAX:-20' in src
+    assert 'last_submit' in src
