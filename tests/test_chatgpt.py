@@ -7,8 +7,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,31 +100,211 @@ class ExitCodeTests(unittest.TestCase):
             self.assertEqual(stdout, f"{output.resolve()}\n")
 
 
+class ComposerTests(unittest.TestCase):
+    def test_composer_requires_exact_prompt(self):
+        page = mock.Mock()
+        page.evaluate.return_value = "wanted prompt"
+        self.assertTrue(ask_core.composer_has_prompt(page, "wanted prompt"))
+
+        page.evaluate.return_value = "stale draft wanted prompt"
+        self.assertFalse(ask_core.composer_has_prompt(page, "wanted prompt"))
+
+
+class ResponseCompletionTests(unittest.TestCase):
+    def test_fresh_turn_with_copy_action_is_complete(self):
+        def count(_page, selectors):
+            if selectors == ask_core.ASSISTANT_MSG_SELECTORS:
+                return 1
+            if selectors == ask_core.COPY_BTN_SELECTORS:
+                return 2
+            return 0
+
+        with mock.patch.object(ask_core, "is_streaming", return_value=False), mock.patch.object(
+            ask_core, "count_nodes", side_effect=count
+        ):
+            self.assertTrue(ask_core.turn_complete(mock.Mock(), base_assistant=0))
+            self.assertFalse(ask_core.turn_complete(mock.Mock(), base_assistant=1))
+
+
+@contextlib.contextmanager
+def held_locks(paths):
+    fds = []
+    try:
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fds.append(fd)
+        yield
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+class SubmitLockTests(unittest.TestCase):
+    def test_release_submit_lock_unlocks_fd_and_removes_info(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock_path = Path(directory) / "run.lock"
+            info_path = Path(f"{lock_path}.info")
+            info_path.write_text("owner\n", encoding="utf-8")
+            fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            env = {
+                "CHATGPT_SUBMIT_LOCK_FD": str(fd),
+                "CHATGPT_SUBMIT_LOCK_INFO": str(info_path),
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                ask_core.release_submit_lock()
+
+            contender = os.open(lock_path, os.O_WRONLY)
+            try:
+                fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(contender)
+            self.assertFalse(info_path.exists())
+            self.assertNotIn("CHATGPT_SUBMIT_LOCK_FD", os.environ)
+
+
 class WrapperLockTests(unittest.TestCase):
-    def test_lock_contention_is_exit_4(self):
+    def wrapper_env(self, home: Path, **updates):
+        env = os.environ.copy()
+        env.pop("CHATGPT_MAX_PARALLEL", None)
+        env["HOME"] = str(home)
+        env.update(updates)
+        return env
+
+    def run_wrapper(self, home: Path, **updates):
+        return subprocess.run(
+            [str(ROOT / "bin" / "chatgpt"), "hello"],
+            env=self.wrapper_env(home, **updates),
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+
+    def test_default_three_slots_are_enforced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            slots = home / ".chatgpt" / "slots"
+            paths = [slots / f"slot{index}.lock" for index in range(3)]
+            with held_locks(paths):
+                result = self.run_wrapper(home, CHATGPT_LOCK_WAIT="0")
+            self.assertEqual(result.returncode, 4)
+            self.assertIn("all 3 run slots are busy", result.stderr)
+
+    def test_max_parallel_env_changes_slot_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            slot = home / ".chatgpt" / "slots" / "slot0.lock"
+            with held_locks([slot]):
+                result = self.run_wrapper(
+                    home,
+                    CHATGPT_LOCK_WAIT="0",
+                    CHATGPT_MAX_PARALLEL="1",
+                )
+            self.assertEqual(result.returncode, 4)
+            self.assertIn("all 1 run slots are busy", result.stderr)
+
+    def test_slot_timeout_is_exit_4(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            slot = home / ".chatgpt" / "slots" / "slot0.lock"
+            started = time.monotonic()
+            with held_locks([slot]):
+                result = self.run_wrapper(
+                    home,
+                    CHATGPT_LOCK_WAIT="1",
+                    CHATGPT_MAX_PARALLEL="1",
+                )
+            elapsed = time.monotonic() - started
+            self.assertEqual(result.returncode, 4)
+            self.assertGreaterEqual(elapsed, 0.5)
+            self.assertIn("slot wait timed out after 1s", result.stderr)
+
+    def test_slot_is_released_when_run_exits(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             state = home / ".chatgpt"
-            state.mkdir()
-            lock_path = state / "run.lock"
-            with lock_path.open("w") as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                env = os.environ.copy()
-                env["HOME"] = str(home)
-                env["CHATGPT_LOCK_WAIT"] = "0"
-                result = subprocess.run(
-                    [str(ROOT / "bin" / "chatgpt"), "hello"],
-                    env=env,
-                    text=True,
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
+            run_lock = state / "run.lock"
+            slot = state / "slots" / "slot0.lock"
+            with held_locks([run_lock]):
+                result = self.run_wrapper(
+                    home,
+                    CHATGPT_LOCK_WAIT="0",
+                    CHATGPT_MAX_PARALLEL="1",
                 )
             self.assertEqual(result.returncode, 4)
-            self.assertEqual(result.stdout, "")
-            self.assertIn("holds the lock", result.stderr)
+            self.assertIn("another submit holds the lock", result.stderr)
+            with held_locks([slot]):
+                pass
+            self.assertFalse(Path(f"{slot}.info").exists())
+
+    def test_submit_lock_releases_while_slot_stays_held(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            home = Path(directory)
+            state = home / ".chatgpt"
+            state.mkdir()
+            (state / "stack.env").write_text("VNC_DISPLAY=:2\n", encoding="utf-8")
+            marker = state / "submit-released"
+            fake_bin = home / "bin"
+            fake_bin.mkdir()
+            scripts = {
+                "curl": "#!/bin/sh\nprintf '{\"Browser\":\"Chrome\"}\\n'\n",
+                "ss": "#!/bin/sh\nprintf 'LISTEN 0 128 127.0.0.1:6080 0.0.0.0:*\\n'\n",
+                "python3": (
+                    "#!/bin/sh\n"
+                    "rm -f \"$CHATGPT_SUBMIT_LOCK_INFO\"\n"
+                    "flock -u \"$CHATGPT_SUBMIT_LOCK_FD\" || exit 70\n"
+                    "touch \"$HOME/.chatgpt/submit-released\"\n"
+                    "sleep 2\n"
+                    "printf 'mock answer\\n'\n"
+                ),
+            }
+            for name, body in scripts.items():
+                path = fake_bin / name
+                path.write_text(body, encoding="utf-8")
+                path.chmod(0o755)
+            env = self.wrapper_env(
+                home,
+                CHATGPT_MAX_PARALLEL="1",
+                PATH=f"{fake_bin}:{os.environ['PATH']}",
+            )
+            process = subprocess.Popen(
+                [str(ROOT / "bin" / "chatgpt"), "hello"],
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                deadline = time.monotonic() + 3
+                while not marker.exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                if not marker.exists():
+                    stdout, stderr = process.communicate(timeout=5)
+                    self.fail(
+                        f"mock core did not release submit lock: "
+                        f"rc={process.returncode} stdout={stdout!r} stderr={stderr!r}"
+                    )
+
+                run_fd = os.open(state / "run.lock", os.O_WRONLY)
+                slot_fd = os.open(state / "slots" / "slot0.lock", os.O_WRONLY)
+                try:
+                    fcntl.flock(run_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(slot_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(run_fd)
+                    os.close(slot_fd)
+                stdout, stderr = process.communicate(timeout=5)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertEqual(stdout, "mock answer\n")
 
 
 if __name__ == "__main__":
     unittest.main()
-

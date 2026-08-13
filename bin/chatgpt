@@ -14,37 +14,99 @@ PROFILE="${CHATGPT_PROFILE:-$HOME/.chatgpt/browser-profile}"
 CDP_PORT="${CHATGPT_CDP_PORT:-9222}"
 NOVNC_PORT="${CHATGPT_NOVNC_PORT:-6080}"
 LOCK_WAIT="${CHATGPT_LOCK_WAIT:-3600}"
+# Internal concurrency override; intentionally not part of the public interface.
+MAX_PARALLEL="${CHATGPT_MAX_PARALLEL:-3}"
 VNCSERVER=/opt/TurboVNC/bin/vncserver
 
-mkdir -p "$STATE_DIR" "$STATE_DIR/out"
+mkdir -p "$STATE_DIR" "$STATE_DIR/out" "$STATE_DIR/slots"
 
-LOCK="$STATE_DIR/run.lock"
-LOCK_INFO="$LOCK.info"
 if ! command -v flock >/dev/null 2>&1; then
   echo "chatgpt: flock is required" >&2
   exit 1
 fi
-exec 9>"$LOCK"
-if ! flock -n 9; then
-  holder="$(sed -n '1p' "$LOCK_INFO" 2>/dev/null || true)"
+
+if [[ ! "$MAX_PARALLEL" =~ ^[1-9][0-9]*$ ]]; then
+  echo "chatgpt: CHATGPT_MAX_PARALLEL must be a positive integer" >&2
+  exit 64
+fi
+if [[ ! "$LOCK_WAIT" =~ ^[0-9]+$ ]]; then
+  echo "chatgpt: CHATGPT_LOCK_WAIT must be a non-negative integer" >&2
+  exit 64
+fi
+
+SLOT_FD=
+SLOT_LOCK=
+acquire_slot() {
+  local candidate_fd index
+  for ((index = 0; index < MAX_PARALLEL; index++)); do
+    exec {candidate_fd}>"$STATE_DIR/slots/slot${index}.lock"
+    if flock -n "$candidate_fd"; then
+      SLOT_FD="$candidate_fd"
+      SLOT_LOCK="$STATE_DIR/slots/slot${index}.lock"
+      return 0
+    fi
+    exec {candidate_fd}>&-
+  done
+  return 1
+}
+
+if ! acquire_slot; then
   if [[ "$LOCK_WAIT" == "0" ]]; then
-    echo "chatgpt: another run holds the lock${holder:+ ($holder)}" >&2
+    echo "chatgpt: all ${MAX_PARALLEL} run slots are busy" >&2
     exit 4
   fi
-  echo "chatgpt: waiting for the active run (up to ${LOCK_WAIT}s)${holder:+; $holder}" >&2
-  if ! flock -w "$LOCK_WAIT" 9; then
-    echo "chatgpt: lock wait timed out after ${LOCK_WAIT}s" >&2
+  echo "chatgpt: waiting for a free run slot (up to ${LOCK_WAIT}s)" >&2
+  slot_deadline_us=$((${EPOCHREALTIME/./} + LOCK_WAIT * 1000000))
+  while ((${EPOCHREALTIME/./} < slot_deadline_us)); do
+    sleep 0.1
+    acquire_slot && break
+  done
+  if [[ -z "$SLOT_FD" ]]; then
+    echo "chatgpt: slot wait timed out after ${LOCK_WAIT}s" >&2
     exit 4
   fi
 fi
-printf 'pid=%s cwd=%s started=%s\n' "$$" "$PWD" "$(date -Is)" > "$LOCK_INFO"
+
+LOCK_OWNER="pid=$$ cwd=$PWD started=$(date -Is)"
+SLOT_INFO="$SLOT_LOCK.info"
+printf '%s\n' "$LOCK_OWNER" > "$SLOT_INFO"
 
 RESPONSE_LOG="$(mktemp "$STATE_DIR/output.XXXXXX.log")"
 cleanup() {
-  rm -f "$LOCK_INFO" "$RESPONSE_LOG"
+  local info
+  for info in "$SLOT_INFO" "${RUN_LOCK_INFO:-}"; do
+    if [[ -n "$info" ]] && [[ "$(sed -n '1p' "$info" 2>/dev/null || true)" == "$LOCK_OWNER" ]]; then
+      rm -f "$info"
+    fi
+  done
+  rm -f "$RESPONSE_LOG"
 }
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
+
+RUN_LOCK="$STATE_DIR/run.lock"
+RUN_LOCK_INFO="$RUN_LOCK.info"
+exec {RUN_FD}>"$RUN_LOCK"
+if ! flock -n "$RUN_FD"; then
+  holder="$(sed -n '1p' "$RUN_LOCK_INFO" 2>/dev/null || true)"
+  if [[ "$LOCK_WAIT" == "0" ]]; then
+    echo "chatgpt: another submit holds the lock${holder:+ ($holder)}" >&2
+    exit 4
+  fi
+  echo "chatgpt: waiting for the active submit (up to ${LOCK_WAIT}s)${holder:+; $holder}" >&2
+  if ! flock -w "$LOCK_WAIT" "$RUN_FD"; then
+    echo "chatgpt: submit lock wait timed out after ${LOCK_WAIT}s" >&2
+    exit 4
+  fi
+fi
+printf '%s\n' "$LOCK_OWNER" > "$RUN_LOCK_INFO"
+
+# Stack daemons must not outlive the invocation with either lock FD inherited.
+without_locks() (
+  exec {SLOT_FD}>&-
+  exec {RUN_FD}>&-
+  "$@"
+)
 
 port_open() {
   ss -ltn 2>/dev/null | grep -q "127.0.0.1:$1 "
@@ -106,7 +168,7 @@ start_vnc() {
     echo "chatgpt: TurboVNC server not found at $VNCSERVER" >&2
     return 1
   fi
-  "$VNCSERVER" "$display" -geometry 1600x1000 -depth 24 \
+  without_locks "$VNCSERVER" "$display" -geometry 1600x1000 -depth 24 \
     -securitytypes otp -interface 127.0.0.1 -wm openbox >/dev/null 2>&1
   sleep 2
   if ! port_open "$(display_port "$display")"; then
@@ -130,7 +192,7 @@ start_chrome() {
   }
   pkill -f -- "user-data-dir=$PROFILE" 2>/dev/null || true
   sleep 2
-  DISPLAY="$VNC_DISPLAY" nohup /usr/bin/google-chrome \
+  DISPLAY="$VNC_DISPLAY" without_locks nohup /usr/bin/google-chrome \
     --remote-debugging-port="$CDP_PORT" \
     --user-data-dir="$PROFILE" \
     --no-first-run --no-default-browser-check --disable-dev-shm-usage \
@@ -155,7 +217,7 @@ start_novnc() {
     echo "chatgpt: websockify is unavailable" >&2
     return 1
   fi
-  nohup websockify --web=/usr/share/novnc "127.0.0.1:$NOVNC_PORT" \
+  without_locks nohup websockify --web=/usr/share/novnc "127.0.0.1:$NOVNC_PORT" \
     "127.0.0.1:$(display_port "$VNC_DISPLAY")" > "$STATE_DIR/novnc.log" 2>&1 &
   sleep 2
   if ! port_open "$NOVNC_PORT"; then
@@ -194,7 +256,10 @@ start_novnc || exit 1
   echo "CDP_PORT=$CDP_PORT"
 } > "$STATE"
 
-CHATGPT_CDP_PORT="$CDP_PORT" python3 "$CORE" "$@" > "$RESPONSE_LOG"
+CHATGPT_CDP_PORT="$CDP_PORT" \
+CHATGPT_SUBMIT_LOCK_FD="$RUN_FD" \
+CHATGPT_SUBMIT_LOCK_INFO="$RUN_LOCK_INFO" \
+  python3 "$CORE" "$@" > "$RESPONSE_LOG"
 rc=$?
 cat "$RESPONSE_LOG"
 exit "$rc"
