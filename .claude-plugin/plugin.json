@@ -1,6 +1,6 @@
 {
   "name": "chatgpt",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Neutral command-line bridge from Claude Code to a logged-in ChatGPT Pro browser session.",
   "author": {
     "name": "Jahn"

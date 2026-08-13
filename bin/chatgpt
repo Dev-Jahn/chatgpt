@@ -25,9 +25,9 @@ LOCK_WAIT="${CHATGPT_LOCK_WAIT:-3600}"
 MAX_PARALLEL="${CHATGPT_MAX_PARALLEL:-3}"
 VNCSERVER=/opt/TurboVNC/bin/vncserver
 if [[ "$OS_NAME" == "Darwin" ]]; then
-  CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+  CHROME_BIN="${CHATGPT_CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
 else
-  CHROME_BIN=/usr/bin/google-chrome
+  CHROME_BIN="${CHATGPT_CHROME_BIN:-/usr/bin/google-chrome}"
 fi
 
 mkdir -p "$STATE_DIR" "$STATE_DIR/out" "$STATE_DIR/slots"
@@ -134,11 +134,17 @@ fi
 date +%s > "$STAMP"
 
 # Stack daemons must not outlive the invocation with either lock FD inherited.
-without_locks() (
-  exec {SLOT_FD}>&-
-  exec {RUN_FD}>&-
-  "$@"
-)
+# The fork must happen AFTER the closes, so this helper backgrounds internally and
+# call sites must not append `&`. Measured (0.2.0, macOS): `without_locks … &` with
+# a subshell-body function made bash fork an outer background shell that never ran
+# the closes and waited on Chrome holding both locks for Chrome's whole life —
+# every later run then blocked on the submit lock until LOCK_WAIT. The inner
+# `exec "$@"` leaves no intermediate shell between the wrapper and the daemon.
+spawn_unlocked() {
+  ( exec {SLOT_FD}>&- {RUN_FD}>&-
+    exec "$@"
+  ) &
+}
 
 port_open() {
   if [[ "$OS_NAME" == "Darwin" ]]; then
@@ -239,12 +245,12 @@ start_chrome() {
   # On macOS the window opens on the real desktop; DISPLAY is a Linux/VNC concept.
   local -a display_env=()
   [[ "$OS_NAME" != "Darwin" ]] && display_env=(env "DISPLAY=$VNC_DISPLAY")
-  without_locks "${display_env[@]}" nohup "$CHROME_BIN" \
+  spawn_unlocked "${display_env[@]}" nohup "$CHROME_BIN" \
     --remote-debugging-port="$CDP_PORT" \
     --user-data-dir="$PROFILE" \
     --no-first-run --no-default-browser-check --disable-dev-shm-usage \
     --window-size=1580,960 https://chatgpt.com \
-    > "$STATE_DIR/chrome.log" 2>&1 &
+    > "$STATE_DIR/chrome.log" 2>&1
   for attempt in $(seq 1 20); do
     if cdp_up; then
       echo "chatgpt: started Chrome CDP $CDP_PORT" >&2
@@ -264,8 +270,8 @@ start_novnc() {
     echo "chatgpt: websockify is unavailable" >&2
     return 1
   fi
-  without_locks nohup websockify --web=/usr/share/novnc "127.0.0.1:$NOVNC_PORT" \
-    "127.0.0.1:$(display_port "$VNC_DISPLAY")" > "$STATE_DIR/novnc.log" 2>&1 &
+  spawn_unlocked nohup websockify --web=/usr/share/novnc "127.0.0.1:$NOVNC_PORT" \
+    "127.0.0.1:$(display_port "$VNC_DISPLAY")" > "$STATE_DIR/novnc.log" 2>&1
   sleep 2
   if ! port_open "$NOVNC_PORT"; then
     echo "chatgpt: noVNC startup failed; inspect $STATE_DIR/novnc.log" >&2
