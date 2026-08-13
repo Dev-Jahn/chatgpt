@@ -1,0 +1,81 @@
+name: Sync marketplace pin
+
+# When main moves, mirror this repo's main sha and the plugin.json version + description into
+# Dev-Jahn/jahns-cc-marketplace's marketplace.json, so the marketplace always pins the latest
+# release. Cross-repo write uses a deploy key scoped to the marketplace repo only (private key
+# in the MARKETPLACE_DEPLOY_KEY secret; public key registered there with write access).
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: sync-marketplace
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main (read plugin version)
+        uses: actions/checkout@v5
+
+      - name: Read plugin version + description
+        id: meta
+        run: |
+          echo "version=$(jq -r .version .claude-plugin/plugin.json)" >> "$GITHUB_OUTPUT"
+          {
+            echo "description<<JWEOF"
+            jq -r .description .claude-plugin/plugin.json
+            echo "JWEOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Configure deploy key
+        env:
+          DEPLOY_KEY: ${{ secrets.MARKETPLACE_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Pin sha + version + description in the marketplace
+        env:
+          NEW_SHA: ${{ github.sha }}
+          NEW_VERSION: ${{ steps.meta.outputs.version }}
+          NEW_DESC: ${{ steps.meta.outputs.description }}
+        run: |
+          set -euo pipefail
+          git clone git@github.com:Dev-Jahn/jahns-cc-marketplace.git mp
+          cd mp
+          f=.claude-plugin/marketplace.json
+          if ! jq -e '.plugins[] | select(.name=="chatgpt")' "$f" > /dev/null; then
+            # First release: append a new entry rather than dying.
+            tmp=$(mktemp)
+            jq --indent 2 --arg sha "$NEW_SHA" --arg ver "$NEW_VERSION" --arg desc "$NEW_DESC" \
+              '.plugins += [{
+                 name: "chatgpt",
+                 description: $desc,
+                 category: "development",
+                 source: {source: "url", url: "https://github.com/Dev-Jahn/chatgpt.git", sha: $sha},
+                 homepage: "https://github.com/Dev-Jahn/chatgpt",
+                 keywords: ["chatgpt","browser-automation","delegation","reasoning"],
+                 version: $ver
+               }]' "$f" > "$tmp"
+            mv "$tmp" "$f"
+          else
+            tmp=$(mktemp)
+            jq --indent 2 --arg sha "$NEW_SHA" --arg ver "$NEW_VERSION" --arg desc "$NEW_DESC" \
+              '(.plugins[] | select(.name=="chatgpt")) |= (.source.sha = $sha | .version = $ver | .description = $desc)' \
+              "$f" > "$tmp"
+            mv "$tmp" "$f"
+          fi
+          if git diff --quiet -- "$f"; then
+            echo "marketplace already in sync at ${NEW_SHA} @ v${NEW_VERSION} — nothing to do."
+            exit 0
+          fi
+          git config user.name "chatgpt-ci"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$f"
+          git commit -qm "chore(chatgpt): sync v${NEW_VERSION} @ ${NEW_SHA:0:7} (auto-sync from main)"
+          git push origin HEAD:main
+          echo "marketplace updated → v${NEW_VERSION} @ ${NEW_SHA:0:7}"

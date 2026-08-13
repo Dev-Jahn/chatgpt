@@ -1,13 +1,17 @@
 ---
 name: chatgpt
-description: 수십 분+ 초고난도 분석/설계/조사/검증을 구독 ChatGPT Pro(GPT-5.6 Sol)에 위임. 프롬프트만 넘기면 됨 — 패킹/템플릿 불요, connector는 프롬프트에서 지시.
+description: Delegate ultra-hard analysis/design/research/verification tasks (tens of minutes+) to subscription ChatGPT Pro (GPT-5.6 Sol, pinned). Just pass a prompt — no packing or templates; ask for authenticated connectors (GitHub etc.) directly in the prompt.
 ---
 
+The plugin's `bin/` is on PATH — call `chatgpt` directly.
+
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/bin/chatgpt" "질문 텍스트"
-"${CLAUDE_PLUGIN_ROOT}/bin/chatgpt" -f prompt.md
-echo "질문 텍스트" | "${CLAUDE_PLUGIN_ROOT}/bin/chatgpt" -
+chatgpt "your question"
+chatgpt -f prompt.md
+echo "your question" | chatgpt -
 ```
 
-장시간 작업이므로 `run_in_background`로 호출한다. 실행은 lock으로 직렬화된다. 종료 코드는 0=성공, 2=모델 검증 실패, 3=timeout, 4=lock timeout이다.
-
+Long-running by nature — invoke with `run_in_background`. Runs are serialized
+by a lock. stdout is the response body only. Exit codes: 0 = success,
+2 = model verification failed (nothing sent), 3 = response timeout,
+4 = lock timeout.

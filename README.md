@@ -1,38 +1,61 @@
 # chatgpt
 
-Claude Code에서 로그인된 구독 ChatGPT Pro 브라우저로 프롬프트를 중립 전달하고 응답 Markdown을 회수하는 독립 플러그인이다. 리뷰 프레이밍, 템플릿, repomix 패킹, connector 개입은 하지 않는다. 모델은 `GPT-5.6 Sol`로 고정 검증되며 기본 추론 강도는 `Pro`다.
+A neutral Claude Code plugin that forwards a prompt to a logged-in subscription
+ChatGPT Pro browser session and returns the response as Markdown. No review
+framing, no templates, no repomix packing, no connector manipulation — just a
+bridge. The model is pinned and verified as `GPT-5.6 Sol` (fail-closed: nothing
+is sent on a mismatch), and the default reasoning effort is `Pro`.
 
-## 설치
+Intended use: offloading ultra-hard analysis / design / research / verification
+tasks that take tens of minutes or more of Pro-tier reasoning.
+
+## Install
 
 ```bash
-claude plugin marketplace add ~/workspace/chatgpt
-claude plugin install chatgpt@chatgpt-local
+claude plugin marketplace add Dev-Jahn/jahns-cc-marketplace
+claude plugin install chatgpt@jahns-cc-marketplace
 ```
 
-직접 CLI로 자주 쓸 경우 선택적으로 링크한다.
+Once the plugin is installed, its `bin/` directory is automatically added to
+`PATH` in Claude Code sessions — just call `chatgpt`. No symlinks needed.
+
+## Usage
 
 ```bash
-ln -s ~/workspace/chatgpt/bin/chatgpt ~/.local/bin/chatgpt
-```
-
-## 사용
-
-```bash
-chatgpt "질문 텍스트"
+chatgpt "your question"
 chatgpt -f prompt.md
-echo "질문 텍스트" | chatgpt -
-chatgpt --effort pro --attach context.pdf --max-wait 7200 --out answer.md "질문"
+echo "your question" | chatgpt -
+chatgpt --effort pro --attach context.pdf --max-wait 7200 --out answer.md "question"
 ```
 
-stdout에는 응답 본문만 출력되고 진행·진단 로그는 stderr로 간다. `--quiet`은 stdout에 저장 경로만 출력한다. 기본 응답 경로는 `~/.chatgpt/out/<timestamp>.md`다. 배타 lock은 `~/.chatgpt/run.lock`이며 `CHATGPT_LOCK_WAIT`(기본 3600초) 동안 기다린다.
+- stdout carries the response body only; progress and diagnostics go to
+  stderr. `--quiet` prints just the saved-file path. Responses are also saved
+  under `~/.chatgpt/out/<timestamp>.md`.
+- Runs are serialized by an exclusive lock (`~/.chatgpt/run.lock`); a second
+  invocation waits up to `CHATGPT_LOCK_WAIT` seconds (default 3600).
+- Exit codes: `0` success, `2` model verification failed (nothing sent),
+  `3` response timeout, `4` lock timeout.
+- Connectors (GitHub, Drive, …) already authenticated in the ChatGPT account
+  are used by simply asking for them in the prompt (e.g. "use the GitHub
+  connector to inspect repo X"); the tool never packs or attaches anything
+  unless you pass `--attach`.
 
-종료 코드는 0=회수 성공, 2=`GPT-5.6 Sol` 검증 실패(전송하지 않음), 3=응답 timeout, 4=lock timeout이다.
-
-## 환경
+## Environment
 
 - Linux, Bash, `flock`, `curl`, `ss`
-- system `python3`와 Python 패키지 `playwright`
-- `/usr/bin/google-chrome`, TurboVNC (`/opt/TurboVNC/bin/vncserver`), `openbox`, `websockify`, noVNC assets
-- 기존 로그인 자산 `~/.insane-review/browser-profile`
+- system `python3` with the `playwright` package
+- `/usr/bin/google-chrome`, TurboVNC (`/opt/TurboVNC/bin/vncserver`),
+  `openbox`, `websockify`, noVNC assets
+- an existing logged-in Chrome profile at `~/.insane-review/browser-profile`
 
-CDP 9222의 기존 insane-review 스택이 살아 있으면 그대로 재사용한다. 아니면 빈 VNC display를 골라 Chrome CDP와 noVNC를 자동 기동하고, 스택 상태와 로그만 `~/.chatgpt/`에 기록한다. 로그인이나 connector 인증은 도구가 변경하지 않는다.
+If a Chrome CDP stack is already alive on port 9222 it is reused. Otherwise a
+free VNC display is picked and Chrome CDP + noVNC are started automatically;
+stack state and logs live under `~/.chatgpt/`. The tool never modifies login
+or connector authentication state.
+
+## Development
+
+Development happens on the `dev` branch, which carries the `tests/` directory.
+`main` is the release branch (tests stripped); every push to `main` runs a
+workflow that pins the new sha/version into
+[`Dev-Jahn/jahns-cc-marketplace`](https://github.com/Dev-Jahn/jahns-cc-marketplace).
