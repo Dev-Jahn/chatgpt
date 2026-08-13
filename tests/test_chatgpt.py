@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import io
+import json
 import os
 import subprocess
 import sys
@@ -381,6 +382,155 @@ class DarwinPathTests(unittest.TestCase):
             self.assertIn("Chrome binary is unavailable", result.stderr)
             self.assertIn("Google Chrome.app", result.stderr)
             self.assertNotIn("VNC", result.stderr)
+
+
+class ProjectNameTests(unittest.TestCase):
+    def test_default_name_is_folder_dot_hash8_and_deterministic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            spot = Path(directory) / "api"
+            spot.mkdir()
+            old = os.getcwd()
+            os.chdir(spot)
+            try:
+                first = ask_core.default_project_name()
+                second = ask_core.default_project_name()
+            finally:
+                os.chdir(old)
+            self.assertEqual(first, second)
+            folder, _, digest = first.rpartition(" · ")
+            self.assertEqual(folder, "api")
+            self.assertRegex(digest, r"^[0-9a-f]{8}$")
+
+    def test_same_folder_name_different_path_gets_different_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            names = []
+            for parent in ("a", "b"):
+                spot = Path(directory) / parent / "api"
+                spot.mkdir(parents=True)
+                old = os.getcwd()
+                os.chdir(spot)
+                try:
+                    names.append(ask_core.default_project_name())
+                finally:
+                    os.chdir(old)
+            self.assertNotEqual(names[0], names[1])
+
+    def test_cache_roundtrip_and_corrupt_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "projects.json"
+            ask_core._save_project_cache(path, {"key": "https://chatgpt.com/g/g-p-x/project"})
+            self.assertEqual(
+                ask_core._load_project_cache(path),
+                {"key": "https://chatgpt.com/g/g-p-x/project"},
+            )
+            path.write_text("{not json", encoding="utf-8")
+            self.assertEqual(ask_core._load_project_cache(path), {})
+            self.assertEqual(ask_core._load_project_cache(path / "absent"), {})
+
+    def test_parse_args_project_flags(self):
+        self.assertEqual(ask_core.parse_args(["--project", "Docs", "hi"]).project, "Docs")
+        self.assertTrue(ask_core.parse_args(["--no-project", "hi"]).no_project)
+        with self.assertRaises(ask_core.UsageError):
+            ask_core.parse_args(["--project", "Docs", "--no-project", "hi"])
+        with self.assertRaises(ask_core.UsageError):
+            ask_core.parse_args(["--project", "  ", "hi"])
+
+    def test_main_resolves_project_for_ask_fn(self):
+        seen = {}
+
+        def capture(_prompt, **kwargs):
+            seen.update(kwargs)
+            return "answer"
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), tempfile.TemporaryDirectory() as directory:
+            out = str(Path(directory) / "a.md")
+            ask_core.main(["--out", out, "hello"], stdin=io.StringIO(), ask_fn=capture)
+            self.assertEqual(seen["project"], ask_core.default_project_name())
+            ask_core.main(["--out", out, "--project", "Docs", "hello"], stdin=io.StringIO(), ask_fn=capture)
+            self.assertEqual(seen["project"], "Docs")
+            ask_core.main(["--out", out, "--no-project", "hello"], stdin=io.StringIO(), ask_fn=capture)
+            self.assertIsNone(seen["project"])
+
+
+class RateLimitModalTests(unittest.TestCase):
+    def modal_page(self, visible=True, text="요청이 너무 많습니다 몇 분 후 다시 시도해 주세요"):
+        node = mock.Mock()
+        node.is_visible.return_value = visible
+        node.inner_text.return_value = text
+        button = mock.Mock()
+        node.query_selector_all.return_value = [button]
+        page = mock.Mock()
+        page.query_selector.return_value = node
+        return page, node, button
+
+    def test_visible_modal_is_reported_and_dismiss_clicks_last_button(self):
+        page, _node, button = self.modal_page()
+        self.assertIn("요청이 너무 많습니다", ask_core.rate_limit_modal(page))
+        with mock.patch.object(ask_core.time, "sleep"):
+            ask_core.dismiss_rate_limit_modal(page)
+        button.click.assert_called_once()
+
+    def test_hidden_or_absent_modal_is_none(self):
+        page, _node, _button = self.modal_page(visible=False)
+        self.assertIsNone(ask_core.rate_limit_modal(page))
+        page.query_selector.return_value = None
+        self.assertIsNone(ask_core.rate_limit_modal(page))
+
+    def test_raise_if_rate_limited_dismisses_then_raises(self):
+        page, _node, button = self.modal_page()
+        with mock.patch.object(ask_core.time, "sleep"):
+            with self.assertRaises(ask_core.RateLimitedError) as caught:
+                ask_core.raise_if_rate_limited(page, "before submit")
+        self.assertIn("before submit", str(caught.exception))
+        button.click.assert_called_once()
+
+    def test_rate_limited_error_is_exit_5(self):
+        def limited(*_args, **_kwargs):
+            raise ask_core.RateLimitedError("mock limit")
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+            code = ask_core.main(["hello"], stdin=io.StringIO(), ask_fn=limited)
+        self.assertEqual(code, 5)
+        self.assertIn("mock limit", stderr.getvalue())
+
+
+class EnsurePageTargetTests(unittest.TestCase):
+    def fake_urlopen(self, targets, calls):
+        import contextlib as _ctx
+
+        def opener(request, timeout=0):
+            url = request if isinstance(request, str) else request.full_url
+            method = "GET" if isinstance(request, str) else request.get_method()
+            calls.append((method, url))
+            reply = mock.Mock()
+            reply.read.return_value = json.dumps(targets).encode("utf-8")
+            return _ctx.nullcontext(reply)
+
+        return opener
+
+    def test_existing_page_target_means_no_new_tab(self):
+        calls = []
+        with mock.patch.object(
+            ask_core.urllib.request, "urlopen",
+            side_effect=self.fake_urlopen([{"type": "page", "url": "about:blank"}], calls),
+        ):
+            ask_core.ensure_page_target(9222)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("/json/list", calls[0][1])
+
+    def test_zero_targets_opens_one(self):
+        calls = []
+        with mock.patch.object(
+            ask_core.urllib.request, "urlopen",
+            side_effect=self.fake_urlopen([], calls),
+        ), mock.patch.object(ask_core.time, "sleep"):
+            ask_core.ensure_page_target(9222)
+        self.assertEqual(len(calls), 2)
+        method, url = calls[1]
+        self.assertEqual(method, "PUT")
+        self.assertIn("/json/new", url)
 
 
 class SpawnUnlockedTests(unittest.TestCase):
