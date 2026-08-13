@@ -101,6 +101,25 @@ if ! flock -n "$RUN_FD"; then
 fi
 printf '%s\n' "$LOCK_OWNER" > "$RUN_LOCK_INFO"
 
+# Rate limiter: ChatGPT throttles rapid successive requests from one account
+# ("too many requests" access block observed 2026-08-13 with 3-way parallel
+# submits). Enforce a minimum randomized gap between consecutive submits,
+# measured from the previous submit timestamp (persisted across invocations).
+# Tunables (undocumented on purpose): CHATGPT_SUBMIT_GAP_MIN/MAX seconds.
+GAP_MIN="${CHATGPT_SUBMIT_GAP_MIN:-8}"
+GAP_MAX="${CHATGPT_SUBMIT_GAP_MAX:-20}"
+STAMP="$STATE_DIR/last_submit"
+now=$(date +%s)
+last=$(cat "$STAMP" 2>/dev/null || echo 0)
+gap=$(( GAP_MIN + RANDOM % (GAP_MAX - GAP_MIN + 1) ))
+elapsed=$(( now - last ))
+if (( elapsed < gap )); then
+  wait_s=$(( gap - elapsed ))
+  echo "chatgpt: rate limiter — sleeping ${wait_s}s before submit" >&2
+  sleep "$wait_s"
+fi
+date +%s > "$STAMP"
+
 # Stack daemons must not outlive the invocation with either lock FD inherited.
 without_locks() (
   exec {SLOT_FD}>&-
