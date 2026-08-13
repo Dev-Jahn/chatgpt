@@ -788,7 +788,11 @@ def wait_for_response(
 
 def ask(prompt: str, *, effort: str, attach: Path | None, max_wait: int) -> str:
     if sync_playwright is None:
-        raise RuntimeError("Python package 'playwright' is required")
+        raise RuntimeError(
+            "Python package 'playwright' is required "
+            "(python3 -m pip install playwright; no browser download needed — "
+            "this only attaches to an already-running Chrome over CDP)"
+        )
     port = int(os.environ.get("CHATGPT_CDP_PORT", "9222"))
     if not port_open(port) or not cdp_browser_ok(port):
         raise RuntimeError(f"CDP {port} is not a supported Chromium browser")
