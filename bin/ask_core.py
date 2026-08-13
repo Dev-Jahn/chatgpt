@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -559,12 +560,7 @@ def composer_text(page) -> str:
 def composer_has_prompt(page, prompt: str) -> bool:
     wanted = normalize(prompt)
     got = normalize(composer_text(page))
-    return (
-        bool(wanted)
-        and wanted in got
-        and got.count(wanted) == 1
-        and len(got) <= len(wanted) * 1.5 + 20
-    )
+    return bool(wanted) and got == wanted
 
 
 def clear_composer(page) -> None:
@@ -590,6 +586,22 @@ def click_send(page) -> None:
                 continue
         time.sleep(1)
     raise RuntimeError("send button never became enabled")
+
+
+def release_submit_lock() -> None:
+    raw_fd = os.environ.pop("CHATGPT_SUBMIT_LOCK_FD", None)
+    lock_info = os.environ.pop("CHATGPT_SUBMIT_LOCK_INFO", None)
+    if raw_fd is None:
+        return
+    if lock_info:
+        try:
+            Path(lock_info).unlink()
+        except FileNotFoundError:
+            pass
+    fd = int(raw_fd)
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+    log("submit lock released")
 
 
 def confirm_sent_and_capture(page, base_user: int) -> str:
@@ -715,12 +727,12 @@ def assistant_markdown(node) -> str:
             return ""
 
 
-def turn_complete(page, base_assistant: int, base_copy: int) -> bool:
+def turn_complete(page, base_assistant: int) -> bool:
     if is_streaming(page):
         return False
     return (
         count_nodes(page, ASSISTANT_MSG_SELECTORS) > base_assistant
-        and count_nodes(page, COPY_BTN_SELECTORS) > base_copy
+        and count_nodes(page, COPY_BTN_SELECTORS) > 0
     )
 
 
@@ -729,7 +741,6 @@ def wait_for_response(
     conversation_url: str,
     base_ids: set[str],
     base_assistant: int,
-    base_copy: int,
     deadline: float,
 ) -> str:
     match = CONV_URL_RE.search(conversation_url)
@@ -751,7 +762,7 @@ def wait_for_response(
             log(f"response {status}; {remaining}s remaining")
             last_status = remaining // STATUS_INTERVAL
         node = fresh_assistant_node(page, base_ids, base_assistant)
-        if node is None or not turn_complete(page, base_assistant, base_copy):
+        if node is None or not turn_complete(page, base_assistant):
             quota = detect_quota(page)
             if quota:
                 raise RuntimeError(f"ChatGPT usage limit: {quota}")
@@ -802,7 +813,6 @@ def ask(prompt: str, *, effort: str, attach: Path | None, max_wait: int) -> str:
 
             base_user = count_nodes_strict(page, USER_MSG_SELECTORS)
             base_assistant = count_nodes_strict(page, ASSISTANT_MSG_SELECTORS)
-            base_copy = count_nodes_strict(page, COPY_BTN_SELECTORS)
             base_ids = message_ids(page)
 
             put_text(page, prompt)
@@ -813,6 +823,7 @@ def ask(prompt: str, *, effort: str, attach: Path | None, max_wait: int) -> str:
                     raise RuntimeError("prompt did not enter the composer intact")
             click_send(page)
             conversation_url = confirm_sent_and_capture(page, base_user)
+            release_submit_lock()
             deadline = time.monotonic() + max_wait
 
             for attempt in range(2):
@@ -822,7 +833,6 @@ def ask(prompt: str, *, effort: str, attach: Path | None, max_wait: int) -> str:
                         conversation_url,
                         base_ids,
                         base_assistant,
-                        base_copy,
                         deadline,
                     )
                 except ResponseTimeoutError:

@@ -11,7 +11,7 @@ chatgpt -f prompt.md
 echo "your question" | chatgpt -
 ```
 
-Long-running by nature — invoke with `run_in_background`. Runs are serialized
-by a lock. stdout is the response body only. Exit codes: 0 = success,
+Long-running by nature — invoke with `run_in_background`. Up to a few runs
+execute concurrently; excess waits on a lock. stdout is the response body only. Exit codes: 0 = success,
 2 = model verification failed (nothing sent), 3 = response timeout,
 4 = lock timeout.

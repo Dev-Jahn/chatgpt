@@ -31,8 +31,8 @@ chatgpt --effort pro --attach context.pdf --max-wait 7200 --out answer.md "quest
 - stdout carries the response body only; progress and diagnostics go to
   stderr. `--quiet` prints just the saved-file path. Responses are also saved
   under `~/.chatgpt/out/<timestamp>.md`.
-- Runs are serialized by an exclusive lock (`~/.chatgpt/run.lock`); a second
-  invocation waits up to `CHATGPT_LOCK_WAIT` seconds (default 3600).
+- Up to a few runs execute concurrently; excess waits on a lock for up to
+  `CHATGPT_LOCK_WAIT` seconds (default 3600).
 - Exit codes: `0` success, `2` model verification failed (nothing sent),
   `3` response timeout, `4` lock timeout.
 - Connectors (GitHub, Drive, …) already authenticated in the ChatGPT account
