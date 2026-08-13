@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "chatgpt-local",
+  "description": "Local marketplace for the chatgpt Claude Code plugin.",
+  "owner": {
+    "name": "Jahn"
+  },
+  "plugins": [
+    {
+      "name": "chatgpt",
+      "description": "Neutral command-line bridge to a logged-in ChatGPT Pro browser session.",
+      "version": "0.1.0",
+      "source": "./"
+    }
+  ]
+}

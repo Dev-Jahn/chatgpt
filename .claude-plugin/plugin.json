@@ -1,0 +1,15 @@
+{
+  "name": "chatgpt",
+  "version": "0.1.0",
+  "description": "Neutral command-line bridge from Claude Code to a logged-in ChatGPT Pro browser session.",
+  "author": {
+    "name": "Jahn"
+  },
+  "keywords": [
+    "chatgpt",
+    "browser-automation",
+    "delegation",
+    "reasoning"
+  ]
+}
+
