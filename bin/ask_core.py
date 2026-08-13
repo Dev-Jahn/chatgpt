@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Send one neutral prompt through a logged-in ChatGPT browser and harvest Markdown."""
+"""Send one neutral prompt through a logged-in ChatGPT browser and harvest Markdown.
+
+Exit codes: 0 success · 1 generic failure · 2 model verification failed (nothing sent)
+· 3 response timeout · 5 ChatGPT rate limit (submit blocked, or harvest blocked after
+the prompt was sent — the message then carries the conversation URL) · 64 usage error.
+The bash wrapper adds 4 for its own lock/slot timeouts."""
 
 from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -78,6 +84,14 @@ MODEL_RE = re.compile(r"GPT|gpt|o\d|Claude|Gemini")
 CONV_URL_RE = re.compile(r"/c/[0-9a-f]{8}[0-9a-f-]{4,}", re.I)
 STABLE_SECS = 4
 STATUS_INTERVAL = 15
+# Project grouping (ported from insane-review's pack_and_ask.py). The /g/g-p- URL mark and
+# the sidebar/aria heuristics below are the early 2026-08 ChatGPT DOM — revalidate on drift.
+PROJECT_URL_MARK = "/g/g-p-"
+NEW_PROJECT_RE = r"새 프로젝트|New project|新規プロジェクト|プロジェクトを追加|Add project|Create project"
+CREATE_SUBMIT_RE = r"프로젝트 만들기|Create project|プロジェクトを作成|^Create$|^作成$|^만들기$"
+# Captured live 2026-08-13: the access-throttle dialog ChatGPT raises after rapid requests
+# ("요청이 너무 많습니다 … 몇 분 후 다시 시도해 주세요", one dismiss button).
+RATE_LIMIT_MODAL_SELECTOR = '[data-testid="modal-conversation-history-rate-limit"]'
 
 
 class UsageError(Exception):
@@ -93,6 +107,10 @@ class ResponseTimeoutError(Exception):
 
 
 class SentUnknownLocationError(Exception):
+    pass
+
+
+class RateLimitedError(Exception):
     pass
 
 
@@ -114,6 +132,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-wait", type=int, default=7200, metavar="SEC")
     parser.add_argument("--out", type=Path, help="response path")
     parser.add_argument("--quiet", action="store_true", help="print only the response path")
+    parser.add_argument(
+        "--project",
+        help="ChatGPT project to group the chat under (default: '<folder> · <hash8>' from the cwd)",
+    )
+    parser.add_argument(
+        "--no-project",
+        action="store_true",
+        help="start a plain chat instead of grouping under a project",
+    )
     return parser
 
 
@@ -125,6 +152,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         raise UsageError("--max-wait must be greater than zero")
     if not args.effort.strip():
         raise UsageError("--effort must not be empty")
+    if args.project is not None and args.no_project:
+        raise UsageError("choose either --project or --no-project, not both")
+    if args.project is not None and not args.project.strip():
+        raise UsageError("--project must not be empty")
     return args
 
 
@@ -313,6 +344,251 @@ def login_state(page, wait_secs: int = 15) -> str:
         if time.monotonic() >= deadline:
             return "unknown"
         time.sleep(0.5)
+
+
+# --- project grouping (ported from insane-review's pack_and_ask.py) --------------------
+# Chats land inside a per-folder ChatGPT project instead of piling up in the root chat
+# list. The project home carries the composer, the file input and the model pill, so once
+# the page sits there the rest of the ask flow is unchanged. Every helper here swallows
+# its exceptions into None/False: a project is a convenience, never a reason to abort.
+
+
+def default_project_name() -> str:
+    """'<folder> · <hash8>' — the path hash keeps two same-named folders (/a/api, /b/api)
+    from merging into one remote project, since remote lookup matches display name only."""
+    digest = hashlib.sha256(str(Path.cwd().resolve()).encode("utf-8")).hexdigest()[:8]
+    return f"{Path.cwd().name} · {digest}"
+
+
+def project_cache_path() -> Path:
+    return Path(os.environ.get("CHATGPT_STATE_DIR", str(Path.home() / ".chatgpt"))) / "projects.json"
+
+
+def project_cache_key(name: str) -> str:
+    # Absolute path in the key: same-named folders do not share a cache row, and neither
+    # do two --project names used from one folder.
+    return f"{Path.cwd().resolve()}::{name}"
+
+
+def _load_project_cache(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_project_cache(path: Path, cache: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def project_home_ok(page, url: str) -> bool:
+    """A cached project URL may be stale (project deleted). Alive means: the home loads,
+    still looks like a project URL, and carries a composer."""
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(2)
+        return PROJECT_URL_MARK in current_url(page) and find_input(page) is not None
+    except Exception:
+        return False
+
+
+def find_project_url(page, name: str) -> str | None:
+    """Recover the home URL of the sidebar project whose display text is exactly `name`.
+
+    Language-independent: rows are matched on their visible text, not on localized aria
+    labels; within the row, the option button's aria-label contains the project name, so
+    the button WITHOUT the name is the navigation one. The sidebar list is virtualized —
+    poll while scrolling its containers so a project below the fold is not missed (and
+    then wrongly re-created)."""
+    try:
+        for _ in range(12):
+            clicked = page.evaluate(
+                """(nm) => {
+                    const lis = [...document.querySelectorAll('nav li, aside li, li')];
+                    for (const li of lis) {
+                        const first = ((li.innerText || '').trim().split('\\n')[0] || '').trim();
+                        const btns = [...li.querySelectorAll('button[aria-label]')];
+                        if (first === nm && btns.length) {
+                            const home = btns.find(b => !((b.getAttribute('aria-label') || '').includes(nm))) || btns[0];
+                            home.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""",
+                name,
+            )
+            if clicked:
+                try:
+                    page.wait_for_url(f"**{PROJECT_URL_MARK}**", wait_until="commit", timeout=8000)
+                except Exception:
+                    pass
+                time.sleep(1.2)
+                url = current_url(page)
+                return url if PROJECT_URL_MARK in url else None
+            page.evaluate(
+                """() => { for (const el of document.querySelectorAll('nav *, aside *')) {
+                    if (el.scrollHeight > el.clientHeight + 20) el.scrollTop = el.scrollHeight; } }"""
+            )
+            time.sleep(0.5)
+    except Exception:
+        return None
+    return None
+
+
+def create_project(page, name: str) -> str | None:
+    """Create the project through the sidebar modal and return its home URL. The name
+    field must be filled (not typed) for the submit button to enable; submit falls back
+    to Enter when the localized button text does not match."""
+    try:
+        opened = page.evaluate(
+            """(re) => { const rx = new RegExp(re, 'i');
+                const b = [...document.querySelectorAll('button[aria-label]')]
+                    .find(x => rx.test(x.getAttribute('aria-label') || ''));
+                if (b) { b.click(); return true; } return false; }""",
+            NEW_PROJECT_RE,
+        )
+    except Exception:
+        return None
+    if not opened:
+        return None  # no new-project affordance (unsupported plan or unmatched locale)
+    try:
+        name_input = page.locator('input[type="text"]:visible').last
+        name_input.wait_for(state="visible", timeout=8000)
+        name_input.click()
+        name_input.fill(name)
+        time.sleep(0.4)
+        submitted = page.evaluate(
+            """(re) => { const rx = new RegExp(re, 'i');
+                const btns = [...document.querySelectorAll('button')]
+                    .filter(b => !b.disabled && rx.test((b.innerText || '').trim()));
+                if (btns.length) { btns[btns.length - 1].click(); return true; } return false; }""",
+            CREATE_SUBMIT_RE,
+        )
+        if not submitted:
+            name_input.press("Enter")
+        page.wait_for_url(f"**{PROJECT_URL_MARK}**", wait_until="commit", timeout=15000)
+        time.sleep(2)
+        url = current_url(page)
+        return url if PROJECT_URL_MARK in url else None
+    except Exception:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return None
+
+
+def ensure_project(page, name: str, cache_key: str, cache_path: Path) -> str | None:
+    """Project home URL via cache → sidebar lookup → creation; None on any failure so the
+    caller can fall back to a plain chat. The cache keeps routine runs off the sidebar
+    heuristics entirely: one goto against the remembered URL and a liveness check."""
+    try:
+        cache = _load_project_cache(cache_path)
+        cached = cache.get(cache_key)
+        if cached and project_home_ok(page, cached):
+            return cached
+        page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(2)
+        url = find_project_url(page, name)
+        if not url:
+            page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=30000)
+            time.sleep(2)
+            url = create_project(page, name)
+        if url:
+            cache[cache_key] = url
+            _save_project_cache(cache_path, cache)
+        return url
+    except Exception:
+        return None
+
+
+def enter_project(page, name: str) -> bool:
+    """Land the page on the named project's home with a live composer; False falls back
+    to a plain chat (the caller re-navigates)."""
+    url = ensure_project(page, name, project_cache_key(name), project_cache_path())
+    if not url:
+        return False
+    try:
+        page.goto(url, wait_until="load", timeout=60000)
+    except Exception:
+        return False
+    time.sleep(2)
+    for _ in range(10):
+        if find_input(page) is not None:
+            return True
+        time.sleep(1)
+    return False
+
+
+# --- rate-limit modal ------------------------------------------------------------------
+
+
+def rate_limit_modal(page) -> str | None:
+    """The visible throttle dialog's text, or None. Kept separate from detect_quota: the
+    quota hints scan dialog text for plan-limit wording, while this modal is a distinct
+    access block with its own testid that can sit over an otherwise healthy page."""
+    try:
+        node = page.query_selector(RATE_LIMIT_MODAL_SELECTOR)
+        if node is not None and node.is_visible():
+            return normalize(node.inner_text())[:200]
+    except Exception:
+        pass
+    return None
+
+
+def dismiss_rate_limit_modal(page) -> None:
+    """Click the modal's last button — language-agnostic on purpose (the one observed
+    button reads '알겠습니다' in a Korean UI and would read differently elsewhere)."""
+    try:
+        node = page.query_selector(RATE_LIMIT_MODAL_SELECTOR)
+        if node is None:
+            return
+        buttons = node.query_selector_all("button")
+        if buttons:
+            buttons[-1].click()
+            time.sleep(0.5)
+    except Exception:
+        pass
+
+
+def raise_if_rate_limited(page, context_note: str) -> None:
+    limited = rate_limit_modal(page)
+    if limited:
+        dismiss_rate_limit_modal(page)
+        raise RateLimitedError(f"{context_note}: {limited}")
+
+
+# --- zero-target CDP recovery ----------------------------------------------------------
+
+
+def ensure_page_target(port: int) -> None:
+    """A stack Chrome whose windows were all closed by the user keeps answering
+    /json/version but lists zero page targets, and connect_over_cdp then fails with
+    "Browser context management is not supported" (measured 2026-08-13). Opening one tab
+    over plain HTTP restores a connectable browser; if the recovery itself fails, the
+    normal connect error is the one worth seeing."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=4) as result:
+            targets = json.loads(result.read().decode("utf-8"))
+        if any(target.get("type") == "page" for target in targets):
+            return
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/json/new?url={CHATGPT_URL}", method="PUT"
+        )
+        with urllib.request.urlopen(request, timeout=6):
+            pass
+        log("no page target on CDP; opened one")
+        time.sleep(2)
+    except Exception:
+        pass
 
 
 def read_model_pills(page) -> list[str]:
@@ -763,6 +1039,12 @@ def wait_for_response(
             last_status = remaining // STATUS_INTERVAL
         node = fresh_assistant_node(page, base_ids, base_assistant)
         if node is None or not turn_complete(page, base_assistant):
+            # The prompt is already in flight here: a throttle now blocks only the
+            # harvest, so the error must carry the conversation URL for a later pickup.
+            raise_if_rate_limited(
+                page,
+                f"rate limited while harvesting; the prompt was sent ({conversation_url})",
+            )
             quota = detect_quota(page)
             if quota:
                 raise RuntimeError(f"ChatGPT usage limit: {quota}")
@@ -786,7 +1068,14 @@ def wait_for_response(
     raise ResponseTimeoutError("response wait timed out")
 
 
-def ask(prompt: str, *, effort: str, attach: Path | None, max_wait: int) -> str:
+def ask(
+    prompt: str,
+    *,
+    effort: str,
+    attach: Path | None,
+    max_wait: int,
+    project: str | None = None,
+) -> str:
     if sync_playwright is None:
         raise RuntimeError(
             "Python package 'playwright' is required "
@@ -796,6 +1085,7 @@ def ask(prompt: str, *, effort: str, attach: Path | None, max_wait: int) -> str:
     port = int(os.environ.get("CHATGPT_CDP_PORT", "9222"))
     if not port_open(port) or not cdp_browser_ok(port):
         raise RuntimeError(f"CDP {port} is not a supported Chromium browser")
+    ensure_page_target(port)
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
@@ -810,6 +1100,18 @@ def ask(prompt: str, *, effort: str, attach: Path | None, max_wait: int) -> str:
             if state != "ok":
                 detail = "login wall detected" if state == "no" else "composer not detected"
                 raise RuntimeError(f"ChatGPT session unavailable: {detail}")
+            raise_if_rate_limited(page, "rate limited before submit; nothing sent")
+
+            if project:
+                if enter_project(page, project):
+                    log(f"chat grouped under project {project!r}: {current_url(page)}")
+                else:
+                    # A project is a convenience: any failure to secure one falls back to
+                    # a plain chat with a working composer, never an abort.
+                    log(f"project {project!r} unavailable; continuing in a plain chat")
+                    page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=60000)
+                    if login_state(page) != "ok":
+                        raise RuntimeError("ChatGPT session unavailable after project fallback")
 
             select_model(page, effort)
             if attach is not None:
@@ -825,6 +1127,7 @@ def ask(prompt: str, *, effort: str, attach: Path | None, max_wait: int) -> str:
                 put_text(page, prompt)
                 if not composer_has_prompt(page, prompt):
                     raise RuntimeError("prompt did not enter the composer intact")
+            raise_if_rate_limited(page, "rate limited before submit; nothing sent")
             click_send(page)
             conversation_url = confirm_sent_and_capture(page, base_user)
             release_submit_lock()
@@ -839,8 +1142,8 @@ def ask(prompt: str, *, effort: str, attach: Path | None, max_wait: int) -> str:
                         base_assistant,
                         deadline,
                     )
-                except ResponseTimeoutError:
-                    raise
+                except (ResponseTimeoutError, RateLimitedError):
+                    raise  # neither gets better by reloading the page right away
                 except Exception as exc:
                     if attempt == 1 or time.monotonic() >= deadline:
                         raise
@@ -873,11 +1176,13 @@ def main(
         if args.attach is not None and not args.attach.expanduser().is_file():
             raise UsageError(f"attachment is not a file: {args.attach}")
         output = response_path(args.out)
+        project = None if args.no_project else (args.project or default_project_name())
         response = ask_fn(
             prompt,
             effort=args.effort,
             attach=args.attach,
             max_wait=args.max_wait,
+            project=project,
         ).strip()
         if not response:
             raise RuntimeError("harvested response is empty")
@@ -896,6 +1201,9 @@ def main(
     except ResponseTimeoutError as exc:
         print(f"chatgpt: {exc}", file=sys.stderr)
         return 3
+    except RateLimitedError as exc:
+        print(f"chatgpt: {exc}", file=sys.stderr)
+        return 5
     except KeyboardInterrupt:
         print("chatgpt: interrupted", file=sys.stderr)
         return 130
