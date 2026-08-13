@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+BIN_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)"
+CORE="$BIN_DIR/ask_core.py"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  exec python3 "$CORE" "$@"
+fi
+
+STATE_DIR="$HOME/.chatgpt"
+STATE="$STATE_DIR/stack.env"
+LEGACY_STATE="$HOME/.insane-review/stack.env"
+PROFILE="$HOME/.insane-review/browser-profile"
+CDP_PORT="${CHATGPT_CDP_PORT:-9222}"
+NOVNC_PORT="${CHATGPT_NOVNC_PORT:-6080}"
+LOCK_WAIT="${CHATGPT_LOCK_WAIT:-3600}"
+VNCSERVER=/opt/TurboVNC/bin/vncserver
+
+mkdir -p "$STATE_DIR" "$STATE_DIR/out"
+
+LOCK="$STATE_DIR/run.lock"
+LOCK_INFO="$LOCK.info"
+if ! command -v flock >/dev/null 2>&1; then
+  echo "chatgpt: flock is required" >&2
+  exit 1
+fi
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  holder="$(sed -n '1p' "$LOCK_INFO" 2>/dev/null || true)"
+  if [[ "$LOCK_WAIT" == "0" ]]; then
+    echo "chatgpt: another run holds the lock${holder:+ ($holder)}" >&2
+    exit 4
+  fi
+  echo "chatgpt: waiting for the active run (up to ${LOCK_WAIT}s)${holder:+; $holder}" >&2
+  if ! flock -w "$LOCK_WAIT" 9; then
+    echo "chatgpt: lock wait timed out after ${LOCK_WAIT}s" >&2
+    exit 4
+  fi
+fi
+printf 'pid=%s cwd=%s started=%s\n' "$$" "$PWD" "$(date -Is)" > "$LOCK_INFO"
+
+RESPONSE_LOG="$(mktemp "$STATE_DIR/output.XXXXXX.log")"
+cleanup() {
+  rm -f "$LOCK_INFO" "$RESPONSE_LOG"
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+
+port_open() {
+  ss -ltn 2>/dev/null | grep -q "127.0.0.1:$1 "
+}
+
+cdp_up() {
+  curl -sf --max-time 3 "http://127.0.0.1:$CDP_PORT/json/version" \
+    | grep -Eq '"Browser"[[:space:]]*:[[:space:]]*"(Chrome|Chromium|HeadlessChrome|Edg|Comet)'
+}
+
+display_port() {
+  echo $((5900 + ${1#:}))
+}
+
+my_vnc_display() {
+  local pid args display
+  for pid in $(pgrep -u "$(id -u)" -x Xvnc 2>/dev/null); do
+    args="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    display="$(printf '%s\n' "$args" | grep -oE '(^|[[:space:]])(:[0-9]+)' | head -1 | tr -d ' ')"
+    if [[ -n "$display" ]] && port_open "$(display_port "$display")"; then
+      printf '%s\n' "$display"
+      return 0
+    fi
+  done
+  return 1
+}
+
+pick_free_display() {
+  local n
+  for n in $(seq 2 20); do
+    [[ -e "/tmp/.X11-unix/X$n" ]] && continue
+    port_open "$((5900 + n))" && continue
+    printf ':%s\n' "$n"
+    return 0
+  done
+  return 1
+}
+
+read_display_from_state() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+  sed -n 's/^VNC_DISPLAY=\(:[0-9][0-9]*\)$/\1/p' "$file" | head -1
+}
+
+start_vnc() {
+  local display
+  display="$(my_vnc_display || true)"
+  if [[ -n "$display" ]]; then
+    VNC_DISPLAY="$display"
+    echo "chatgpt: reusing VNC $VNC_DISPLAY" >&2
+    return 0
+  fi
+  display="$(pick_free_display || true)"
+  if [[ -z "$display" ]]; then
+    echo "chatgpt: no free VNC display in :2..:20" >&2
+    return 1
+  fi
+  if [[ ! -x "$VNCSERVER" ]]; then
+    echo "chatgpt: TurboVNC server not found at $VNCSERVER" >&2
+    return 1
+  fi
+  "$VNCSERVER" "$display" -geometry 1600x1000 -depth 24 \
+    -securitytypes otp -interface 127.0.0.1 -wm openbox >/dev/null 2>&1
+  sleep 2
+  if ! port_open "$(display_port "$display")"; then
+    echo "chatgpt: VNC startup failed; inspect $HOME/.vnc" >&2
+    return 1
+  fi
+  VNC_DISPLAY="$display"
+  echo "chatgpt: started VNC $VNC_DISPLAY" >&2
+}
+
+start_chrome() {
+  local attempt
+  cdp_up && return 0
+  if [[ ! -x /usr/bin/google-chrome ]]; then
+    echo "chatgpt: /usr/bin/google-chrome is unavailable" >&2
+    return 1
+  fi
+  [[ -d "$PROFILE" ]] || {
+    echo "chatgpt: logged-in browser profile is missing: $PROFILE" >&2
+    return 1
+  }
+  pkill -f -- "user-data-dir=$PROFILE" 2>/dev/null || true
+  sleep 2
+  DISPLAY="$VNC_DISPLAY" nohup /usr/bin/google-chrome \
+    --remote-debugging-port="$CDP_PORT" \
+    --user-data-dir="$PROFILE" \
+    --no-first-run --no-default-browser-check --disable-dev-shm-usage \
+    --window-size=1580,960 https://chatgpt.com \
+    > "$STATE_DIR/chrome.log" 2>&1 &
+  for attempt in $(seq 1 20); do
+    if cdp_up; then
+      echo "chatgpt: started Chrome CDP $CDP_PORT" >&2
+      return 0
+    fi
+    sleep 1
+  done
+  echo "chatgpt: Chrome CDP startup failed; inspect $STATE_DIR/chrome.log" >&2
+  return 1
+}
+
+start_novnc() {
+  if port_open "$NOVNC_PORT"; then
+    return 0
+  fi
+  if ! command -v websockify >/dev/null 2>&1; then
+    echo "chatgpt: websockify is unavailable" >&2
+    return 1
+  fi
+  nohup websockify --web=/usr/share/novnc "127.0.0.1:$NOVNC_PORT" \
+    "127.0.0.1:$(display_port "$VNC_DISPLAY")" > "$STATE_DIR/novnc.log" 2>&1 &
+  sleep 2
+  if ! port_open "$NOVNC_PORT"; then
+    echo "chatgpt: noVNC startup failed; inspect $STATE_DIR/novnc.log" >&2
+    return 1
+  fi
+  echo "chatgpt: started noVNC $NOVNC_PORT" >&2
+}
+
+VNC_DISPLAY="$(read_display_from_state "$STATE" || true)"
+if [[ -z "$VNC_DISPLAY" ]]; then
+  VNC_DISPLAY="$(read_display_from_state "$LEGACY_STATE" || true)"
+fi
+if [[ -z "$VNC_DISPLAY" ]]; then
+  VNC_DISPLAY="$(my_vnc_display || true)"
+fi
+
+if cdp_up; then
+  echo "chatgpt: reusing Chrome CDP $CDP_PORT" >&2
+else
+  start_vnc || exit 1
+  start_chrome || exit 1
+fi
+
+if [[ -z "$VNC_DISPLAY" ]]; then
+  VNC_DISPLAY="$(my_vnc_display || true)"
+fi
+if [[ -z "$VNC_DISPLAY" ]]; then
+  echo "chatgpt: could not determine the VNC display" >&2
+  exit 1
+fi
+export DISPLAY="$VNC_DISPLAY"
+
+start_novnc || exit 1
+{
+  echo "# Generated by chatgpt; do not edit while the stack is running."
+  echo "VNC_DISPLAY=$VNC_DISPLAY"
+  echo "NOVNC_PORT=$NOVNC_PORT"
+  echo "CDP_PORT=$CDP_PORT"
+} > "$STATE"
+
+CHATGPT_CDP_PORT="$CDP_PORT" python3 "$CORE" "$@" > "$RESPONSE_LOG"
+rc=$?
+cat "$RESPONSE_LOG"
+exit "$rc"
