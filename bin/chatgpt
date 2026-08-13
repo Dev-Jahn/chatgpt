@@ -10,8 +10,7 @@ fi
 
 STATE_DIR="$HOME/.chatgpt"
 STATE="$STATE_DIR/stack.env"
-LEGACY_STATE="$HOME/.insane-review/stack.env"
-PROFILE="$HOME/.insane-review/browser-profile"
+PROFILE="${CHATGPT_PROFILE:-$HOME/.chatgpt/browser-profile}"
 CDP_PORT="${CHATGPT_CDP_PORT:-9222}"
 NOVNC_PORT="${CHATGPT_NOVNC_PORT:-6080}"
 LOCK_WAIT="${CHATGPT_LOCK_WAIT:-3600}"
@@ -167,9 +166,6 @@ start_novnc() {
 }
 
 VNC_DISPLAY="$(read_display_from_state "$STATE" || true)"
-if [[ -z "$VNC_DISPLAY" ]]; then
-  VNC_DISPLAY="$(read_display_from_state "$LEGACY_STATE" || true)"
-fi
 if [[ -z "$VNC_DISPLAY" ]]; then
   VNC_DISPLAY="$(my_vnc_display || true)"
 fi
