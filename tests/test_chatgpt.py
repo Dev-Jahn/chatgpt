@@ -306,6 +306,78 @@ class WrapperLockTests(unittest.TestCase):
             self.assertEqual(stdout, "mock answer\n")
 
 
+class DarwinPathTests(unittest.TestCase):
+    """The wrapper's Darwin branch must complete without any VNC/noVNC machinery."""
+
+    def test_darwin_reuses_cdp_and_skips_vnc(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            fake_bin = home / "bin"
+            fake_bin.mkdir()
+            scripts = {
+                "uname": "#!/bin/sh\nprintf 'Darwin\\n'\n",
+                "curl": "#!/bin/sh\nprintf '{\"Browser\":\"Chrome\"}\\n'\n",
+                # lsof must not be consulted when CDP is already up; make it fail
+                # loudly if it is.
+                "lsof": "#!/bin/sh\nexit 66\n",
+                "python3": "#!/bin/sh\nprintf 'darwin answer\\n'\n",
+            }
+            for name, body in scripts.items():
+                path = fake_bin / name
+                path.write_text(body, encoding="utf-8")
+                path.chmod(0o755)
+            env = os.environ.copy()
+            env.pop("CHATGPT_MAX_PARALLEL", None)
+            env["HOME"] = str(home)
+            env["PATH"] = f"{fake_bin}:{env['PATH']}"
+            result = subprocess.run(
+                [str(ROOT / "bin" / "chatgpt"), "hello"],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "darwin answer\n")
+            self.assertIn("reusing Chrome CDP", result.stderr)
+            self.assertNotIn("VNC", result.stderr)
+            state = (home / ".chatgpt" / "stack.env").read_text(encoding="utf-8")
+            self.assertNotIn("VNC_DISPLAY", state)
+
+    def test_darwin_missing_chrome_fails_with_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            fake_bin = home / "bin"
+            fake_bin.mkdir()
+            scripts = {
+                "uname": "#!/bin/sh\nprintf 'Darwin\\n'\n",
+                # CDP down -> the wrapper must try to start Chrome and fail on
+                # the (absent in this sandbox) macOS app-bundle binary.
+                "curl": "#!/bin/sh\nexit 1\n",
+                "lsof": "#!/bin/sh\nexit 1\n",
+            }
+            for name, body in scripts.items():
+                path = fake_bin / name
+                path.write_text(body, encoding="utf-8")
+                path.chmod(0o755)
+            env = os.environ.copy()
+            env.pop("CHATGPT_MAX_PARALLEL", None)
+            env["HOME"] = str(home)
+            env["PATH"] = f"{fake_bin}:{env['PATH']}"
+            result = subprocess.run(
+                [str(ROOT / "bin" / "chatgpt"), "hello"],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("Google Chrome.app", result.stderr)
+            self.assertNotIn("VNC", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
 
