@@ -19,6 +19,20 @@ claude plugin install chatgpt@jahns-cc-marketplace
 Once the plugin is installed, its `bin/` directory is automatically added to
 `PATH` in Claude Code sessions — just call `chatgpt`. No symlinks needed.
 
+On a fresh Linux x86_64 host with apt (Debian/Ubuntu), `chatgpt-setup` installs
+everything listed under [Environment](#environment) and then walks you through
+the one manual step, signing in:
+
+```bash
+chatgpt-setup --check    # report what is present / missing; no sudo, no network
+chatgpt-setup            # install the missing pieces (apt via sudo, uv, Chrome .deb)
+chatgpt-setup --login    # start VNC + Chrome + noVNC and print a URL + one-time password
+```
+
+`--login` prints an `ssh -L` tunnel line and a `http://localhost:6080/vnc.html?…`
+URL; sign in to chatgpt.com in that Chrome window once and the profile keeps the
+session. Other platforms exit 2 — install by hand from the list below.
+
 ## Usage
 
 ```bash
@@ -42,16 +56,22 @@ chatgpt --effort pro --attach context.pdf --max-wait 7200 --out answer.md "quest
 
 ## Environment
 
-- Linux, Bash, `flock`, `curl`, `ss`
-- system `python3` with the `playwright` package
-- `/usr/bin/google-chrome`, TurboVNC (`/opt/TurboVNC/bin/vncserver`),
-  `openbox`, `websockify`, noVNC assets
+- Linux, Bash ≥ 5, `flock`, `curl`, `ss`
+- `python3` with the `playwright` package — `uv tool install playwright` is
+  enough (the launcher finds that venv on its own when the system `python3`
+  cannot import it; `CHATGPT_PYTHON` forces a specific interpreter). No
+  `playwright install` — the tool attaches to Chrome over CDP.
+- `/usr/bin/google-chrome` (`CHATGPT_CHROME_BIN`), TurboVNC
+  (`/opt/TurboVNC/bin/vncserver`, `CHATGPT_VNCSERVER`), `openbox`,
+  `websockify`, noVNC assets under `/usr/share/novnc`
 - a logged-in Chrome profile at `~/.chatgpt/browser-profile` (override with `CHATGPT_PROFILE`)
 
 If a Chrome CDP stack is already alive on port 9222 it is reused. Otherwise a
 free VNC display is picked and Chrome CDP + noVNC are started automatically;
 stack state and logs live under `~/.chatgpt/`. The tool never modifies login
-or connector authentication state.
+or connector authentication state. `CHATGPT_STACK_ONLY=1 chatgpt` brings the
+stack up (or reuses it) and exits without submitting — that is what
+`chatgpt-setup --login` builds on.
 
 ## Development
 

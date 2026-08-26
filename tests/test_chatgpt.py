@@ -576,6 +576,293 @@ class SpawnUnlockedTests(unittest.TestCase):
                 self.assertFalse(line.rstrip().endswith("&"), line)
 
 
+
+def _write_stubs(directory: Path, scripts: dict[str, str]) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, body in scripts.items():
+        path = directory / name
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+
+
+def _linux_stack_stubs(home: Path) -> dict[str, str]:
+    """Stubs for the Linux branch of bin/chatgpt. Every daemon the wrapper spawns drops a
+    marker under $MARK; `ss`/`curl` answer from those markers, so the wrapper only sees a
+    port as open once the matching stub actually ran."""
+    mark = home / "mark"
+    mark.mkdir()
+    return {
+        "uname": "#!/bin/sh\nprintf 'Linux\\n'\n",
+        "pgrep": "#!/bin/sh\nexit 1\n",
+        "curl": (
+            "#!/bin/sh\n"
+            f'[ -e "{mark}/chrome" ] || exit 1\n'
+            "printf '{\"Browser\":\"Chrome/1.0\"}\\n'\n"
+        ),
+        "ss": (
+            "#!/bin/sh\n"
+            f'for f in "{mark}"/port*; do [ -e "$f" ] || continue; '
+            'printf "LISTEN 0 128 127.0.0.1:${f##*port} 0.0.0.0:*\\n"; done\n'
+        ),
+        # Receives ":N" first; a real vncserver would listen on 5900+N.
+        "vncserver": (
+            "#!/bin/sh\n"
+            f'n="${{1#:}}"; touch "{mark}/port$((5900 + n))"; touch "{mark}/vnc-args-$*"\n'
+        ),
+        "chrome": f"#!/bin/sh\ntouch \"{mark}/chrome\"\n",
+        "websockify": f"#!/bin/sh\ntouch \"{mark}/port6080\"\n",
+        # `-c` is the wrapper's own `import playwright` probe, not an ask_core run.
+        "python3": f"#!/bin/sh\n[ \"$1\" = -c ] && exit 0\ntouch \"{mark}/python3\"\nprintf 'linux answer\\n'\n",
+    }
+
+
+def _run_wrapper(home: Path, fake_bin: Path, argv=("hello",), **updates):
+    env = os.environ.copy()
+    env.pop("CHATGPT_MAX_PARALLEL", None)
+    env.pop("CHATGPT_PYTHON", None)
+    env.pop("CHATGPT_STACK_ONLY", None)
+    env["HOME"] = str(home)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env.update(updates)
+    return subprocess.run(
+        [str(ROOT / "bin" / "chatgpt"), *argv],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+
+
+class LinuxStackPathTests(unittest.TestCase):
+    """The Linux branch must bring up VNC, Chrome and noVNC through spawn_unlocked.
+    Regression: 0.2.1 renamed the helper but start_vnc still called `without_locks`, so
+    on a fresh Linux host the VNC server was never launched ("VNC startup failed")."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.fake_bin = self.home / "bin"
+        _write_stubs(self.fake_bin, _linux_stack_stubs(self.home))
+        (self.home / ".chatgpt" / "browser-profile").mkdir(parents=True)
+        self.overrides = {
+            "CHATGPT_VNCSERVER": str(self.fake_bin / "vncserver"),
+            "CHATGPT_CHROME_BIN": str(self.fake_bin / "chrome"),
+            "CHATGPT_SUBMIT_GAP_MIN": "0",
+            "CHATGPT_SUBMIT_GAP_MAX": "0",
+        }
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_fresh_host_starts_vnc_chrome_novnc_then_answers(self):
+        result = _run_wrapper(self.home, self.fake_bin, **self.overrides)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "linux answer\n")
+        self.assertIn("started VNC :", result.stderr)
+        self.assertIn("started Chrome CDP 9222", result.stderr)
+        self.assertIn("started noVNC 6080", result.stderr)
+        state = (self.home / ".chatgpt" / "stack.env").read_text(encoding="utf-8")
+        self.assertRegex(state, r"(?m)^VNC_DISPLAY=:\d+$")
+        vnc_args = [p.name for p in (self.home / "mark").glob("vnc-args-*")]
+        self.assertEqual(len(vnc_args), 1, vnc_args)
+        self.assertIn("-securitytypes otp", vnc_args[0])
+        self.assertIn("-wm openbox", vnc_args[0])
+
+    def test_stack_only_exits_before_submit(self):
+        result = _run_wrapper(self.home, self.fake_bin, argv=(), CHATGPT_STACK_ONLY="1", **self.overrides)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("stack ready", result.stderr)
+        self.assertIn("started noVNC 6080", result.stderr)
+        self.assertFalse((self.home / "mark" / "python3").exists(), "ask_core must not run")
+        self.assertFalse((self.home / ".chatgpt" / "last_submit").exists(), "limiter stamp must not move")
+
+    def test_no_reference_to_the_old_helper_name(self):
+        wrapper = (ROOT / "bin" / "chatgpt").read_text(encoding="utf-8")
+        for line in wrapper.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            self.assertNotIn("without_locks", line, line)
+
+
+class PythonResolutionTests(unittest.TestCase):
+    """ask_core runs under the first interpreter that can import playwright: CHATGPT_PYTHON,
+    then python3, then the venv `uv tool install playwright` creates. Uses the Darwin
+    branch (CDP already up) so no stack machinery is involved."""
+
+    def darwin_stubs(self):
+        return {
+            "uname": "#!/bin/sh\nprintf 'Darwin\\n'\n",
+            "curl": "#!/bin/sh\nprintf '{\"Browser\":\"Chrome\"}\\n'\n",
+            "lsof": "#!/bin/sh\nexit 66\n",
+        }
+
+    def test_falls_back_to_uv_tool_venv_when_python3_lacks_playwright(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            fake_bin = home / "bin"
+            uv_tools = home / "uvtools"
+            _write_stubs(fake_bin, {
+                **self.darwin_stubs(),
+                # `python3 -c 'import playwright'` fails; anything else would be a bug.
+                "python3": "#!/bin/sh\n[ \"$1\" = -c ] && exit 1\nprintf 'system python ran\\n'\nexit 99\n",
+                "uv": f"#!/bin/sh\n[ \"$1 $2\" = 'tool dir' ] && printf '{uv_tools}\\n'\n",
+            })
+            _write_stubs(uv_tools / "playwright" / "bin", {
+                "python": "#!/bin/sh\n[ \"$1\" = -c ] && exit 0\nprintf 'uv venv answer\\n'\n",
+            })
+            result = _run_wrapper(home, fake_bin)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "uv venv answer\n")
+
+    def test_explicit_chatgpt_python_wins(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            fake_bin = home / "bin"
+            _write_stubs(fake_bin, {
+                **self.darwin_stubs(),
+                "python3": "#!/bin/sh\nprintf 'system python answer\\n'\n",
+                "mypython": "#!/bin/sh\nprintf 'explicit answer\\n'\n",
+            })
+            result = _run_wrapper(home, fake_bin, CHATGPT_PYTHON=str(fake_bin / "mypython"))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "explicit answer\n")
+
+    def test_help_uses_resolved_interpreter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            fake_bin = home / "bin"
+            _write_stubs(fake_bin, {"mypython": "#!/bin/sh\nprintf 'help from %s\\n' \"$2\"\n"})
+            result = _run_wrapper(home, fake_bin, argv=("--help",), CHATGPT_PYTHON=str(fake_bin / "mypython"))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "help from --help\n")
+
+
+class SetupScriptTests(unittest.TestCase):
+    """bin/chatgpt-setup: platform gate and the --check report. Install paths need root
+    and the network, so they are exercised by hand on a fresh host, not here."""
+
+    SETUP = ROOT / "bin" / "chatgpt-setup"
+
+    def run_setup(self, home: Path, fake_bin: Path, *argv, **updates):
+        env = os.environ.copy()
+        for key in ("CHATGPT_PYTHON", "CHATGPT_PROFILE", "CHATGPT_CHROME_BIN", "CHATGPT_VNCSERVER"):
+            env.pop(key, None)
+        env["HOME"] = str(home)
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env.update(updates)
+        return subprocess.run(
+            [str(self.SETUP), *argv], env=env, text=True, capture_output=True, timeout=30, check=False
+        )
+
+    def linux_stubs(self, dpkg_status: str) -> dict[str, str]:
+        return {
+            "uname": "#!/bin/sh\ncase \"$1\" in -m) printf 'x86_64\\n' ;; *) printf 'Linux\\n' ;; esac\n",
+            "dpkg-query": f"#!/bin/sh\nprintf '{dpkg_status}'\n",
+            "flock": "#!/bin/sh\n", "curl": "#!/bin/sh\n", "ss": "#!/bin/sh\n", "gpg": "#!/bin/sh\n",
+        }
+
+    def os_release(self, home: Path, text: str) -> str:
+        path = home / "os-release"
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    def test_non_debian_platform_is_exit_2(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            fake_bin = home / "bin"
+            _write_stubs(fake_bin, {"uname": "#!/bin/sh\ncase \"$1\" in -m) printf 'arm64\\n' ;; *) printf 'Darwin\\n' ;; esac\n"})
+            result = self.run_setup(home, fake_bin, "--check", CHATGPT_OS_RELEASE=str(home / "absent"))
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("Darwin/arm64", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+    def test_id_like_debian_passes_the_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            fake_bin = home / "bin"
+            _write_stubs(fake_bin, self.linux_stubs(""))
+            release = self.os_release(home, 'ID=linuxmint\nID_LIKE="ubuntu debian"\n')
+            result = self.run_setup(home, fake_bin, "--check", CHATGPT_OS_RELEASE=release,
+                                    CHATGPT_VNCSERVER=str(home / "absent"), CHATGPT_CHROME_BIN=str(home / "absent"),
+                                    CHATGPT_PROFILE=str(home / "absent"))
+            self.assertNotEqual(result.returncode, 2, result.stderr)
+            self.assertIn("dependency", result.stdout)
+
+    def test_check_reports_ok_when_everything_is_present(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            fake_bin = home / "bin"
+            _write_stubs(fake_bin, {
+                **self.linux_stubs("install ok installed"),
+                "python3": "#!/bin/sh\nexit 0\n",
+                "uv": "#!/bin/sh\n",
+                "vncserver": "#!/bin/sh\n",
+                "chrome": "#!/bin/sh\n",
+            })
+            profile = home / "profile"
+            profile.mkdir()
+            release = self.os_release(home, "ID=ubuntu\nID_LIKE=debian\n")
+            result = self.run_setup(home, fake_bin, "--check", CHATGPT_OS_RELEASE=release,
+                                    CHATGPT_VNCSERVER=str(fake_bin / "vncserver"),
+                                    CHATGPT_CHROME_BIN=str(fake_bin / "chrome"),
+                                    CHATGPT_PROFILE=str(profile))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("MISSING", result.stdout)
+            self.assertIn("all dependencies present", result.stderr)
+            rows = [line.split()[0] for line in result.stdout.splitlines()[1:]]
+            self.assertEqual(rows, ["bash>=5", "flock", "curl", "ss", "gpg", "python3", "openbox", "websockify",
+                                    "novnc", "fonts-cjk", "turbovnc", "chrome", "uv", "playwright", "profile-dir"])
+
+    def test_check_lists_missing_items_and_exits_1(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            fake_bin = home / "bin"
+            uv_tools = home / "uvtools"
+            uv_tools.mkdir()
+            _write_stubs(fake_bin, {
+                **self.linux_stubs(""),
+                "python3": "#!/bin/sh\nexit 1\n",
+                "uv": f"#!/bin/sh\n[ \"$1 $2\" = 'tool dir' ] && printf '{uv_tools}\\n'\n",
+            })
+            release = self.os_release(home, "ID=debian\n")
+            result = self.run_setup(home, fake_bin, "--check", CHATGPT_OS_RELEASE=release,
+                                    CHATGPT_VNCSERVER=str(home / "absent"), CHATGPT_CHROME_BIN=str(home / "absent"),
+                                    CHATGPT_PROFILE=str(home / "absent"))
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            missing = {line.split()[0] for line in result.stdout.splitlines() if " MISSING " in line}
+            self.assertEqual(missing, {"openbox", "websockify", "novnc", "fonts-cjk", "turbovnc", "chrome",
+                                       "playwright", "profile-dir"})
+            self.assertIn("missing: openbox websockify novnc fonts-cjk turbovnc chrome playwright profile-dir", result.stderr)
+            self.assertRegex(result.stdout, r"(?m)^uv\s+OK\b")
+
+    def test_check_never_touches_sudo_or_the_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            fake_bin = home / "bin"
+            _write_stubs(fake_bin, {
+                **self.linux_stubs(""),
+                "sudo": "#!/bin/sh\necho SUDO-CALLED >&2; exit 77\n",
+                "apt-get": "#!/bin/sh\necho APT-CALLED >&2; exit 77\n",
+                "curl": "#!/bin/sh\necho CURL-CALLED >&2; exit 77\n",
+                "python3": "#!/bin/sh\nexit 1\n",
+            })
+            release = self.os_release(home, "ID=debian\n")
+            result = self.run_setup(home, fake_bin, "--check", CHATGPT_OS_RELEASE=release,
+                                    CHATGPT_VNCSERVER=str(home / "absent"), CHATGPT_CHROME_BIN=str(home / "absent"),
+                                    CHATGPT_PROFILE=str(home / "absent"))
+            self.assertEqual(result.returncode, 1)
+            for token in ("SUDO-CALLED", "APT-CALLED", "CURL-CALLED"):
+                self.assertNotIn(token, result.stderr)
+
+    def test_unknown_option_is_usage_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            result = self.run_setup(home, home / "nobin", "--bogus")
+            self.assertEqual(result.returncode, 64)
+            self.assertIn("unknown option", result.stderr)
+
 if __name__ == "__main__":
     unittest.main()
 
