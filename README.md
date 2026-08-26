@@ -67,7 +67,9 @@ chatgpt --effort pro --attach context.pdf --max-wait 7200 --out answer.md "quest
 - a logged-in Chrome profile at `~/.chatgpt/browser-profile` (override with `CHATGPT_PROFILE`)
 
 If a Chrome CDP stack is already alive on port 9222 it is reused. Otherwise a
-free VNC display is picked and Chrome CDP + noVNC are started automatically;
+free VNC display is picked and Chrome CDP + noVNC are started automatically
+(on Linux with software WebGL — `--enable-unsafe-swiftshader` — because OpenAI's
+sentinel bot check hangs without WebGL on a GPU-less VNC display);
 stack state and logs live under `~/.chatgpt/`. The tool never modifies login
 or connector authentication state. `CHATGPT_STACK_ONLY=1 chatgpt` brings the
 stack up (or reuses it) and exits without submitting — that is what

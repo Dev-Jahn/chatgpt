@@ -609,7 +609,7 @@ def _linux_stack_stubs(home: Path) -> dict[str, str]:
             "#!/bin/sh\n"
             f'n="${{1#:}}"; touch "{mark}/port$((5900 + n))"; touch "{mark}/vnc-args-$*"\n'
         ),
-        "chrome": f"#!/bin/sh\ntouch \"{mark}/chrome\"\n",
+        "chrome": f"#!/bin/sh\ntouch \"{mark}/chrome\"\nprintf '%s\\n' \"$*\" > \"{mark}/chrome-args\"\n",
         "websockify": f"#!/bin/sh\ntouch \"{mark}/port6080\"\n",
         # `-c` is the wrapper's own `import playwright` probe, not an ask_core run.
         "python3": f"#!/bin/sh\n[ \"$1\" = -c ] && exit 0\ntouch \"{mark}/python3\"\nprintf 'linux answer\\n'\n",
@@ -668,6 +668,11 @@ class LinuxStackPathTests(unittest.TestCase):
         self.assertEqual(len(vnc_args), 1, vnc_args)
         self.assertIn("-securitytypes otp", vnc_args[0])
         self.assertIn("-wm openbox", vnc_args[0])
+        chrome_args = (self.home / "mark" / "chrome-args").read_text(encoding="utf-8")
+        # Software WebGL: OpenAI's sentinel check hangs without it on a GPU-less Xvnc.
+        self.assertIn("--enable-unsafe-swiftshader", chrome_args)
+        self.assertIn("--use-angle=swiftshader", chrome_args)
+        self.assertIn(f"--user-data-dir={self.home}/.chatgpt/browser-profile", chrome_args)
 
     def test_stack_only_exits_before_submit(self):
         result = _run_wrapper(self.home, self.fake_bin, argv=(), CHATGPT_STACK_ONLY="1", **self.overrides)

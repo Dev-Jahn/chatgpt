@@ -273,12 +273,20 @@ start_chrome() {
   pkill -f -- "user-data-dir=$PROFILE" 2>/dev/null || true
   sleep 2
   # On macOS the window opens on the real desktop; DISPLAY is a Linux/VNC concept.
-  local -a display_env=()
-  [[ "$OS_NAME" != "Darwin" ]] && display_env=(env "DISPLAY=$VNC_DISPLAY")
+  # Xvnc has no GPU, and Chrome no longer falls back to software WebGL on its own
+  # (--enable-unsafe-swiftshader is required since ~M131). OpenAI's sentinel bot check
+  # needs WebGL: without it the login "Continue" spinner and prompt submits hang with zero
+  # network traffic (measured on a headless Ubuntu 24.04 host, Chrome 152).
+  local -a display_env=() gpu_flags=()
+  if [[ "$OS_NAME" != "Darwin" ]]; then
+    display_env=(env "DISPLAY=$VNC_DISPLAY")
+    gpu_flags=(--enable-unsafe-swiftshader --use-angle=swiftshader)
+  fi
   spawn_unlocked "${display_env[@]}" nohup "$CHROME_BIN" \
     --remote-debugging-port="$CDP_PORT" \
     --user-data-dir="$PROFILE" \
     --no-first-run --no-default-browser-check --disable-dev-shm-usage \
+    "${gpu_flags[@]}" \
     --window-size=1580,960 https://chatgpt.com \
     > "$STATE_DIR/chrome.log" 2>&1
   for attempt in $(seq 1 20); do
