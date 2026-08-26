@@ -52,6 +52,9 @@ MAX_PARALLEL="${CHATGPT_MAX_PARALLEL:-3}"
 # submitting anything. Used by `chatgpt-setup --login` so the user can sign in through noVNC.
 STACK_ONLY="${CHATGPT_STACK_ONLY:-0}"
 VNCSERVER="${CHATGPT_VNCSERVER:-/opt/TurboVNC/bin/vncserver}"
+# VirtualGL puts Chrome's WebGL on a real GPU (Linux). An explicitly empty CHATGPT_VGLRUN opts
+# out, hence `-` rather than `:-`.
+VGLRUN="${CHATGPT_VGLRUN-/opt/VirtualGL/bin/vglrun}"
 if [[ "$OS_NAME" == "Darwin" ]]; then
   CHROME_BIN="${CHATGPT_CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
 else
@@ -273,16 +276,27 @@ start_chrome() {
   pkill -f -- "user-data-dir=$PROFILE" 2>/dev/null || true
   sleep 2
   # On macOS the window opens on the real desktop; DISPLAY is a Linux/VNC concept.
-  # Xvnc has no GPU, and Chrome no longer falls back to software WebGL on its own
-  # (--enable-unsafe-swiftshader is required since ~M131). OpenAI's sentinel bot check
-  # needs WebGL: without it the login "Continue" spinner and prompt submits hang with zero
-  # network traffic (measured on a headless Ubuntu 24.04 host, Chrome 152).
-  local -a display_env=() gpu_flags=()
+  # Xvnc has no GPU, and OpenAI's sentinel bot check needs WebGL. Measured on a headless
+  # Ubuntu 24.04 host (Chrome 152): with no WebGL the login "Continue" spinner hangs with
+  # zero network traffic; with software WebGL (SwiftShader) it still hangs — the renderer
+  # name itself reads as headless; on a real GPU through VirtualGL's EGL back end the login
+  # goes through. VirtualGL needs no X server on the GPU, but Chrome's GPU sandbox blocks
+  # its X connection, hence --disable-gpu-sandbox. Without VirtualGL fall back to software
+  # WebGL (--enable-unsafe-swiftshader is required since ~M131) and say so.
+  local -a display_env=() gl_prefix=() gpu_flags=()
+  local gpu_mode=""
   if [[ "$OS_NAME" != "Darwin" ]]; then
     display_env=(env "DISPLAY=$VNC_DISPLAY")
-    gpu_flags=(--enable-unsafe-swiftshader --use-angle=swiftshader)
+    if [[ -n "$VGLRUN" && -x "$VGLRUN" ]]; then
+      gl_prefix=("$VGLRUN" -d egl)
+      gpu_flags=(--ignore-gpu-blocklist --disable-gpu-sandbox)
+      gpu_mode=" (GPU via VirtualGL)"
+    else
+      gpu_flags=(--enable-unsafe-swiftshader --use-angle=swiftshader)
+      gpu_mode=" (software WebGL — no VirtualGL)"
+    fi
   fi
-  spawn_unlocked "${display_env[@]}" nohup "$CHROME_BIN" \
+  spawn_unlocked "${display_env[@]}" nohup "${gl_prefix[@]}" "$CHROME_BIN" \
     --remote-debugging-port="$CDP_PORT" \
     --user-data-dir="$PROFILE" \
     --no-first-run --no-default-browser-check --disable-dev-shm-usage \
@@ -291,7 +305,7 @@ start_chrome() {
     > "$STATE_DIR/chrome.log" 2>&1
   for attempt in $(seq 1 20); do
     if cdp_up; then
-      echo "chatgpt: started Chrome CDP $CDP_PORT" >&2
+      echo "chatgpt: started Chrome CDP $CDP_PORT$gpu_mode" >&2
       return 0
     fi
     sleep 1

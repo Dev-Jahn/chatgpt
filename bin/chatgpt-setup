@@ -17,10 +17,13 @@ PROFILE="${CHATGPT_PROFILE:-$HOME/.chatgpt/browser-profile}"
 CHROME_BIN="${CHATGPT_CHROME_BIN:-/usr/bin/google-chrome}"
 VNCSERVER="${CHATGPT_VNCSERVER:-/opt/TurboVNC/bin/vncserver}"
 VNCPASSWD="$(dirname -- "$VNCSERVER")/vncpasswd"
+VGLRUN="${CHATGPT_VGLRUN-/opt/VirtualGL/bin/vglrun}"   # empty = opt out of the GPU path
 NOVNC_PORT="${CHATGPT_NOVNC_PORT:-6080}"
 CHROME_DEB_URL="https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
 TURBOVNC_KEY_URL="https://packagecloud.io/dcommander/turbovnc/gpgkey"
 TURBOVNC_LIST_URL="https://raw.githubusercontent.com/TurboVNC/repo/main/TurboVNC.list"
+VIRTUALGL_KEY_URL="https://packagecloud.io/dcommander/virtualgl/gpgkey"
+VIRTUALGL_LIST_URL="https://raw.githubusercontent.com/VirtualGL/repo/main/VirtualGL.list"
 UV_INSTALL_URL="https://astral.sh/uv/install.sh"
 
 MODE=install
@@ -72,6 +75,7 @@ have_playwright() {
   local py; py="$(uv_playwright_python)" || return 1
   [[ -x "$py" ]] && "$py" -c 'import playwright' >/dev/null 2>&1
 }
+has_nvidia_gpu() { nvidia-smi -L >/dev/null 2>&1; }
 
 # name | check | how it gets installed (for the report)
 CHECKS=(
@@ -92,10 +96,25 @@ CHECKS=(
   "profile-dir  | [[ -d \"\$PROFILE\" ]]                        | mkdir; then sign in via 'chatgpt-setup --login'"
 )
 
+# VirtualGL puts Chrome's WebGL on a real GPU. OpenAI's bot check treated the software
+# (SwiftShader) renderer as headless — the login hung after the password step — so on a
+# host with an NVIDIA GPU it is a dependency, not a nicety. Its EGL back end needs no X
+# server on the GPU; /dev/nvidia* is world-accessible on stock driver installs, so
+# vglserver_config is not required.
+VGL_NOTE=""
+if [[ -z "$VGLRUN" ]]; then
+  VGL_NOTE="virtualgl: skipped (CHATGPT_VGLRUN is empty — software WebGL)"
+elif has_nvidia_gpu; then
+  CHECKS+=("virtualgl    | [[ -x \"\$VGLRUN\" ]]                        | apt: virtualgl (packagecloud.io/dcommander/virtualgl) — GPU WebGL for Chrome")
+else
+  VGL_NOTE="virtualgl: skipped (no NVIDIA GPU: 'nvidia-smi -L' failed — software WebGL)"
+fi
+
 MISSING=()
 run_checks() {
   local row name check how status
   MISSING=()
+  [[ -n "$VGL_NOTE" ]] && log "$VGL_NOTE"
   printf '%-13s %-8s %s\n' "dependency" "status" "source"
   for row in "${CHECKS[@]}"; do
     IFS='|' read -r name check how <<< "$row"
@@ -142,6 +161,19 @@ install_turbovnc() {
     APT_UPDATED=0
   fi
   apt_install turbovnc
+}
+
+install_virtualgl() {
+  need_sudo
+  if [[ ! -f /etc/apt/sources.list.d/VirtualGL.list ]]; then
+    log "adding the VirtualGL apt repository"
+    curl -fsSL "$VIRTUALGL_KEY_URL" | gpg --dearmor \
+      | "${SUDO[@]}" tee /etc/apt/trusted.gpg.d/VirtualGL.gpg >/dev/null || die "VirtualGL key download failed"
+    "${SUDO[@]}" curl -fsSL -o /etc/apt/sources.list.d/VirtualGL.list "$VIRTUALGL_LIST_URL" \
+      || die "VirtualGL.list download failed"
+    APT_UPDATED=0
+  fi
+  apt_install virtualgl
 }
 
 install_chrome() {
@@ -191,6 +223,7 @@ install_platform() {
     case "$name" in
       turbovnc)     install_turbovnc ;;
       chrome)       install_chrome ;;
+      virtualgl)    install_virtualgl ;;
       uv)           have_cmd uv || install_uv ;;
       playwright)   install_playwright ;;
       profile-dir)  mkdir -p "$PROFILE"; log "created $PROFILE (empty — sign in with 'chatgpt-setup --login')" ;;

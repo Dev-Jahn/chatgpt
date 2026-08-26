@@ -610,6 +610,8 @@ def _linux_stack_stubs(home: Path) -> dict[str, str]:
             f'n="${{1#:}}"; touch "{mark}/port$((5900 + n))"; touch "{mark}/vnc-args-$*"\n'
         ),
         "chrome": f"#!/bin/sh\ntouch \"{mark}/chrome\"\nprintf '%s\\n' \"$*\" > \"{mark}/chrome-args\"\n",
+        # `vglrun -d egl <cmd…>`: record the VirtualGL args, then run the command.
+        "vglrun": f"#!/bin/sh\nprintf '%s\\n' \"$*\" > \"{mark}/vglrun-args\"\n[ \"$1\" = -d ] && shift 2\nexec \"$@\"\n",
         "websockify": f"#!/bin/sh\ntouch \"{mark}/port6080\"\n",
         # `-c` is the wrapper's own `import playwright` probe, not an ask_core run.
         "python3": f"#!/bin/sh\n[ \"$1\" = -c ] && exit 0\ntouch \"{mark}/python3\"\nprintf 'linux answer\\n'\n",
@@ -648,6 +650,7 @@ class LinuxStackPathTests(unittest.TestCase):
         self.overrides = {
             "CHATGPT_VNCSERVER": str(self.fake_bin / "vncserver"),
             "CHATGPT_CHROME_BIN": str(self.fake_bin / "chrome"),
+            "CHATGPT_VGLRUN": "",  # no VirtualGL: the software-WebGL path
             "CHATGPT_SUBMIT_GAP_MIN": "0",
             "CHATGPT_SUBMIT_GAP_MAX": "0",
         }
@@ -669,10 +672,28 @@ class LinuxStackPathTests(unittest.TestCase):
         self.assertIn("-securitytypes otp", vnc_args[0])
         self.assertIn("-wm openbox", vnc_args[0])
         chrome_args = (self.home / "mark" / "chrome-args").read_text(encoding="utf-8")
-        # Software WebGL: OpenAI's sentinel check hangs without it on a GPU-less Xvnc.
+        # Software WebGL: OpenAI's sentinel check hangs without any WebGL on a GPU-less Xvnc.
         self.assertIn("--enable-unsafe-swiftshader", chrome_args)
         self.assertIn("--use-angle=swiftshader", chrome_args)
         self.assertIn(f"--user-data-dir={self.home}/.chatgpt/browser-profile", chrome_args)
+        self.assertIn("software WebGL", result.stderr)
+        self.assertFalse((self.home / "mark" / "vglrun-args").exists())
+
+    def test_virtualgl_present_puts_chrome_on_the_gpu(self):
+        """With VirtualGL available Chrome runs under `vglrun -d egl` with the GPU sandbox
+        off (it blocks VirtualGL's X connection) and no SwiftShader flags — the software
+        renderer is what OpenAI's bot check rejected during login."""
+        overrides = {**self.overrides, "CHATGPT_VGLRUN": str(self.fake_bin / "vglrun")}
+        result = _run_wrapper(self.home, self.fake_bin, **overrides)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "linux answer\n")
+        self.assertIn("GPU via VirtualGL", result.stderr)
+        vgl_args = (self.home / "mark" / "vglrun-args").read_text(encoding="utf-8")
+        self.assertTrue(vgl_args.startswith("-d egl "), vgl_args)
+        chrome_args = (self.home / "mark" / "chrome-args").read_text(encoding="utf-8")
+        self.assertIn("--ignore-gpu-blocklist", chrome_args)
+        self.assertIn("--disable-gpu-sandbox", chrome_args)
+        self.assertNotIn("swiftshader", chrome_args)
 
     def test_stack_only_exits_before_submit(self):
         result = _run_wrapper(self.home, self.fake_bin, argv=(), CHATGPT_STACK_ONLY="1", **self.overrides)
@@ -752,7 +773,7 @@ class SetupScriptTests(unittest.TestCase):
 
     def run_setup(self, home: Path, fake_bin: Path, *argv, **updates):
         env = os.environ.copy()
-        for key in ("CHATGPT_PYTHON", "CHATGPT_PROFILE", "CHATGPT_CHROME_BIN", "CHATGPT_VNCSERVER"):
+        for key in ("CHATGPT_PYTHON", "CHATGPT_PROFILE", "CHATGPT_CHROME_BIN", "CHATGPT_VNCSERVER", "CHATGPT_VGLRUN"):
             env.pop(key, None)
         env["HOME"] = str(home)
         env["PATH"] = f"{fake_bin}:{env['PATH']}"
@@ -761,11 +782,13 @@ class SetupScriptTests(unittest.TestCase):
             [str(self.SETUP), *argv], env=env, text=True, capture_output=True, timeout=30, check=False
         )
 
-    def linux_stubs(self, dpkg_status: str) -> dict[str, str]:
+    def linux_stubs(self, dpkg_status: str, gpu: bool = True) -> dict[str, str]:
         return {
             "uname": "#!/bin/sh\ncase \"$1\" in -m) printf 'x86_64\\n' ;; *) printf 'Linux\\n' ;; esac\n",
             "dpkg-query": f"#!/bin/sh\nprintf '{dpkg_status}'\n",
             "flock": "#!/bin/sh\n", "curl": "#!/bin/sh\n", "ss": "#!/bin/sh\n", "gpg": "#!/bin/sh\n",
+            # `nvidia-smi -L` succeeding is how the script decides a GPU is present.
+            "nvidia-smi": "#!/bin/sh\nexit 0\n" if gpu else "#!/bin/sh\nexit 1\n",
         }
 
     def os_release(self, home: Path, text: str) -> str:
@@ -805,6 +828,7 @@ class SetupScriptTests(unittest.TestCase):
                 "uv": "#!/bin/sh\n",
                 "vncserver": "#!/bin/sh\n",
                 "chrome": "#!/bin/sh\n",
+                "vglrun": "#!/bin/sh\n",
             })
             profile = home / "profile"
             profile.mkdir()
@@ -812,13 +836,32 @@ class SetupScriptTests(unittest.TestCase):
             result = self.run_setup(home, fake_bin, "--check", CHATGPT_OS_RELEASE=release,
                                     CHATGPT_VNCSERVER=str(fake_bin / "vncserver"),
                                     CHATGPT_CHROME_BIN=str(fake_bin / "chrome"),
+                                    CHATGPT_VGLRUN=str(fake_bin / "vglrun"),
                                     CHATGPT_PROFILE=str(profile))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertNotIn("MISSING", result.stdout)
             self.assertIn("all dependencies present", result.stderr)
             rows = [line.split()[0] for line in result.stdout.splitlines()[1:]]
             self.assertEqual(rows, ["bash>=5", "flock", "curl", "ss", "gpg", "python3", "openbox", "websockify",
-                                    "novnc", "fonts-cjk", "turbovnc", "chrome", "uv", "playwright", "profile-dir"])
+                                    "novnc", "fonts-cjk", "turbovnc", "chrome", "uv", "playwright", "profile-dir",
+                                    "virtualgl"])
+
+    def test_virtualgl_row_only_on_nvidia_hosts_and_not_when_opted_out(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            fake_bin = home / "bin"
+            _write_stubs(fake_bin, {**self.linux_stubs("", gpu=False), "python3": "#!/bin/sh\nexit 1\n"})
+            release = self.os_release(home, "ID=debian\n")
+            common = dict(CHATGPT_OS_RELEASE=release, CHATGPT_VNCSERVER=str(home / "absent"),
+                          CHATGPT_CHROME_BIN=str(home / "absent"), CHATGPT_PROFILE=str(home / "absent"))
+            result = self.run_setup(home, fake_bin, "--check", **common)
+            self.assertNotIn("virtualgl ", result.stdout)
+            self.assertIn("virtualgl: skipped (no NVIDIA GPU", result.stderr)
+            # GPU present but explicitly opted out.
+            _write_stubs(fake_bin, {"nvidia-smi": "#!/bin/sh\nexit 0\n"})
+            result = self.run_setup(home, fake_bin, "--check", CHATGPT_VGLRUN="", **common)
+            self.assertNotIn("virtualgl ", result.stdout)
+            self.assertIn("virtualgl: skipped (CHATGPT_VGLRUN is empty", result.stderr)
 
     def test_check_lists_missing_items_and_exits_1(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -834,12 +877,13 @@ class SetupScriptTests(unittest.TestCase):
             release = self.os_release(home, "ID=debian\n")
             result = self.run_setup(home, fake_bin, "--check", CHATGPT_OS_RELEASE=release,
                                     CHATGPT_VNCSERVER=str(home / "absent"), CHATGPT_CHROME_BIN=str(home / "absent"),
-                                    CHATGPT_PROFILE=str(home / "absent"))
+                                    CHATGPT_VGLRUN=str(home / "absent"), CHATGPT_PROFILE=str(home / "absent"))
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             missing = {line.split()[0] for line in result.stdout.splitlines() if " MISSING " in line}
             self.assertEqual(missing, {"openbox", "websockify", "novnc", "fonts-cjk", "turbovnc", "chrome",
-                                       "playwright", "profile-dir"})
-            self.assertIn("missing: openbox websockify novnc fonts-cjk turbovnc chrome playwright profile-dir", result.stderr)
+                                       "playwright", "profile-dir", "virtualgl"})
+            self.assertIn("missing: openbox websockify novnc fonts-cjk turbovnc chrome playwright profile-dir virtualgl",
+                          result.stderr)
             self.assertRegex(result.stdout, r"(?m)^uv\s+OK\b")
 
     def test_check_never_touches_sudo_or_the_network(self):
