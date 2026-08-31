@@ -710,7 +710,69 @@ def open_effort_submenu(page) -> bool:
     return False
 
 
+def effort_slider_locked(page) -> bool:
+    """The compact model menu renders effort as a slider; a disabled one cannot be set.
+
+    Seen on project composers as of 2026-09: the slider announces arrow-key
+    adjustment while its menu item carries aria-disabled, and neither keyboard,
+    tick clicks, nor thumb drags move it. Detecting it turns a generic selection
+    failure into an actionable message."""
+    for slider in page.query_selector_all("[data-model-reasoning-effort-slider]"):
+        try:
+            item = slider.evaluate_handle(
+                'el => el.closest(\'[role="menuitem"]\')'
+            ).as_element()
+        except Exception:
+            item = None
+        if item is not None and item.get_attribute("aria-disabled") == "true":
+            return True
+    return False
+
+
+EFFORT_SLIDER_ORDER = ["instant", "medium", "high", "extra high", "pro"]
+
+
+def choose_effort_slider(page, effort: str) -> bool:
+    """Set the effort through the compact menu's Power slider by clicking its tick.
+
+    The 2026-09 model menu replaces the effort radio items with a five-position
+    slider (Instant through Pro). Synthetic arrow keys and thumb drags do not
+    move it, but a click on the wanted tick does, and the composer pill updates
+    to the new label. The click must land before anything expands the model
+    section: expanding flips the slider item to aria-disabled."""
+    wanted = normalize(effort).casefold()
+    if wanted not in EFFORT_SLIDER_ORDER:
+        return False
+    target = EFFORT_SLIDER_ORDER.index(wanted)
+    container = _q(page, ["[data-model-reasoning-effort-slider]"])
+    if container is None:
+        return False
+    item = None
+    try:
+        item = container.evaluate_handle(
+            'el => el.closest(\'[role="menuitem"]\')'
+        ).as_element()
+    except Exception:
+        pass
+    if item is not None and item.get_attribute("aria-disabled") == "true":
+        return False
+    ticks = page.query_selector_all(
+        '[data-model-reasoning-effort-slider] span[class*="Tick"]'
+    )
+    if len(ticks) <= target:
+        return False
+    box = ticks[target].bounding_box()
+    if not box:
+        return False
+    page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    time.sleep(1.2)
+    slider = _q(page, ['[role="slider"]'])
+    return slider is not None and slider.get_attribute("aria-valuenow") == str(target)
+
+
 def choose_effort(page, effort: str) -> bool:
+    if choose_effort_slider(page, effort):
+        return True
     wanted = normalize(effort).casefold()
     candidates = collect_effort_items(page)
     has_radio = any(
@@ -765,7 +827,13 @@ def select_model(page, effort: str) -> str:
         return f"{REQUIRED_MODEL} ({wanted})"
 
     if not choose_effort(page, wanted):
+        locked = effort_slider_locked(page)
         close_menu(page)
+        if locked:
+            raise ModelVerificationError(
+                f"reasoning effort {wanted!r} is locked: the menu renders its "
+                "effort slider as disabled (a reopened, untouched menu is required)"
+            )
         raise ModelVerificationError(f"reasoning effort {wanted!r} could not be selected")
     close_menu(page)
 
