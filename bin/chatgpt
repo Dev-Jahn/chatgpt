@@ -4,8 +4,33 @@ set -uo pipefail
 BIN_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)"
 CORE="$BIN_DIR/ask_core.py"
 
+# ask_core.py needs the `playwright` package. Prefer an explicit CHATGPT_PYTHON, then the
+# system python3 when it can import playwright, then the isolated venv that
+# `uv tool install playwright` creates (PEP 668 hosts such as Debian/Ubuntu refuse a
+# plain `pip install`). Falls back to python3 so ask_core reports the missing package.
+resolve_python() {
+  local candidate
+  if [[ -n "${CHATGPT_PYTHON:-}" ]]; then
+    printf '%s\n' "$CHATGPT_PYTHON"
+    return 0
+  fi
+  if python3 -c 'import playwright' >/dev/null 2>&1; then
+    printf 'python3\n'
+    return 0
+  fi
+  if command -v uv >/dev/null 2>&1; then
+    candidate="$(uv tool dir 2>/dev/null)/playwright/bin/python"
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+  printf 'python3\n'
+}
+PYTHON="$(resolve_python)"
+
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  exec python3 "$CORE" "$@"
+  exec "$PYTHON" "$CORE" "$@"
 fi
 
 if ((BASH_VERSINFO[0] < 5)); then
@@ -23,7 +48,13 @@ NOVNC_PORT="${CHATGPT_NOVNC_PORT:-6080}"
 LOCK_WAIT="${CHATGPT_LOCK_WAIT:-3600}"
 # Internal concurrency override; intentionally not part of the public interface.
 MAX_PARALLEL="${CHATGPT_MAX_PARALLEL:-3}"
-VNCSERVER=/opt/TurboVNC/bin/vncserver
+# CHATGPT_STACK_ONLY=1: bring up (or reuse) the VNC/Chrome/noVNC stack and exit 0 without
+# submitting anything. Used by `chatgpt-setup --login` so the user can sign in through noVNC.
+STACK_ONLY="${CHATGPT_STACK_ONLY:-0}"
+VNCSERVER="${CHATGPT_VNCSERVER:-/opt/TurboVNC/bin/vncserver}"
+# VirtualGL puts Chrome's WebGL on a real GPU (Linux). An explicitly empty CHATGPT_VGLRUN opts
+# out, hence `-` rather than `:-`.
+VGLRUN="${CHATGPT_VGLRUN-/opt/VirtualGL/bin/vglrun}"
 if [[ "$OS_NAME" == "Darwin" ]]; then
   CHROME_BIN="${CHATGPT_CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
 else
@@ -122,16 +153,18 @@ printf '%s\n' "$LOCK_OWNER" > "$RUN_LOCK_INFO"
 GAP_MIN="${CHATGPT_SUBMIT_GAP_MIN:-8}"
 GAP_MAX="${CHATGPT_SUBMIT_GAP_MAX:-20}"
 STAMP="$STATE_DIR/last_submit"
-now=$(date +%s)
-last=$(cat "$STAMP" 2>/dev/null || echo 0)
-gap=$(( GAP_MIN + RANDOM % (GAP_MAX - GAP_MIN + 1) ))
-elapsed=$(( now - last ))
-if (( elapsed < gap )); then
-  wait_s=$(( gap - elapsed ))
-  echo "chatgpt: rate limiter — sleeping ${wait_s}s before submit" >&2
-  sleep "$wait_s"
+if [[ "$STACK_ONLY" != "1" ]]; then
+  now=$(date +%s)
+  last=$(cat "$STAMP" 2>/dev/null || echo 0)
+  gap=$(( GAP_MIN + RANDOM % (GAP_MAX - GAP_MIN + 1) ))
+  elapsed=$(( now - last ))
+  if (( elapsed < gap )); then
+    wait_s=$(( gap - elapsed ))
+    echo "chatgpt: rate limiter — sleeping ${wait_s}s before submit" >&2
+    sleep "$wait_s"
+  fi
+  date +%s > "$STAMP"
 fi
-date +%s > "$STAMP"
 
 # Stack daemons must not outlive the invocation with either lock FD inherited.
 # The fork must happen AFTER the closes, so this helper backgrounds internally and
@@ -210,7 +243,7 @@ start_vnc() {
     echo "chatgpt: TurboVNC server not found at $VNCSERVER" >&2
     return 1
   fi
-  without_locks "$VNCSERVER" "$display" -geometry 1600x1000 -depth 24 \
+  spawn_unlocked "$VNCSERVER" "$display" -geometry 1600x1000 -depth 24 \
     -securitytypes otp -interface 127.0.0.1 -wm openbox >/dev/null 2>&1
   sleep 2
   if ! port_open "$(display_port "$display")"; then
@@ -243,17 +276,36 @@ start_chrome() {
   pkill -f -- "user-data-dir=$PROFILE" 2>/dev/null || true
   sleep 2
   # On macOS the window opens on the real desktop; DISPLAY is a Linux/VNC concept.
-  local -a display_env=()
-  [[ "$OS_NAME" != "Darwin" ]] && display_env=(env "DISPLAY=$VNC_DISPLAY")
-  spawn_unlocked "${display_env[@]}" nohup "$CHROME_BIN" \
+  # Xvnc has no GPU, and OpenAI's sentinel bot check needs WebGL. Measured on a headless
+  # Ubuntu 24.04 host (Chrome 152): with no WebGL the login "Continue" spinner hangs with
+  # zero network traffic; with software WebGL (SwiftShader) it still hangs — the renderer
+  # name itself reads as headless; on a real GPU through VirtualGL's EGL back end the login
+  # goes through. VirtualGL needs no X server on the GPU, but Chrome's GPU sandbox blocks
+  # its X connection, hence --disable-gpu-sandbox. Without VirtualGL fall back to software
+  # WebGL (--enable-unsafe-swiftshader is required since ~M131) and say so.
+  local -a display_env=() gl_prefix=() gpu_flags=()
+  local gpu_mode=""
+  if [[ "$OS_NAME" != "Darwin" ]]; then
+    display_env=(env "DISPLAY=$VNC_DISPLAY")
+    if [[ -n "$VGLRUN" && -x "$VGLRUN" ]]; then
+      gl_prefix=("$VGLRUN" -d egl)
+      gpu_flags=(--ignore-gpu-blocklist --disable-gpu-sandbox)
+      gpu_mode=" (GPU via VirtualGL)"
+    else
+      gpu_flags=(--enable-unsafe-swiftshader --use-angle=swiftshader)
+      gpu_mode=" (software WebGL — no VirtualGL)"
+    fi
+  fi
+  spawn_unlocked "${display_env[@]}" nohup "${gl_prefix[@]}" "$CHROME_BIN" \
     --remote-debugging-port="$CDP_PORT" \
     --user-data-dir="$PROFILE" \
     --no-first-run --no-default-browser-check --disable-dev-shm-usage \
+    "${gpu_flags[@]}" \
     --window-size=1580,960 https://chatgpt.com \
     > "$STATE_DIR/chrome.log" 2>&1
   for attempt in $(seq 1 20); do
     if cdp_up; then
-      echo "chatgpt: started Chrome CDP $CDP_PORT" >&2
+      echo "chatgpt: started Chrome CDP $CDP_PORT$gpu_mode" >&2
       return 0
     fi
     sleep 1
@@ -323,10 +375,15 @@ else
   } > "$STATE"
 fi
 
+if [[ "$STACK_ONLY" == "1" ]]; then
+  echo "chatgpt: stack ready (state in $STATE)" >&2
+  exit 0
+fi
+
 CHATGPT_CDP_PORT="$CDP_PORT" \
 CHATGPT_SUBMIT_LOCK_FD="$RUN_FD" \
 CHATGPT_SUBMIT_LOCK_INFO="$RUN_LOCK_INFO" \
-  python3 "$CORE" "$@" > "$RESPONSE_LOG"
+  "$PYTHON" "$CORE" "$@" > "$RESPONSE_LOG"
 rc=$?
 cat "$RESPONSE_LOG"
 exit "$rc"
