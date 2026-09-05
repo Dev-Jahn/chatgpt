@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# chatgpt-setup — check (and install) everything the `chatgpt` bridge needs on this host,
+# then help with the one manual step: signing in to chatgpt.com inside the Chrome profile.
+#
+#   chatgpt-setup            check every dependency, install the missing ones
+#   chatgpt-setup --check    report only; exit 1 if anything is missing (no sudo, no network)
+#   chatgpt-setup --login    bring up VNC + Chrome + noVNC and print the URL / one-time password
+#
+# Automated platforms: Linux x86_64 with a Debian-family apt (Debian, Ubuntu, …). Other
+# platforms exit 2 with a pointer to the README's Environment section — add a branch to
+# install_platform() when one is ported.
+set -uo pipefail
+
+BIN_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)"
+STATE_DIR="$HOME/.chatgpt"
+PROFILE="${CHATGPT_PROFILE:-$HOME/.chatgpt/browser-profile}"
+CHROME_BIN="${CHATGPT_CHROME_BIN:-/usr/bin/google-chrome}"
+VNCSERVER="${CHATGPT_VNCSERVER:-/opt/TurboVNC/bin/vncserver}"
+VNCPASSWD="$(dirname -- "$VNCSERVER")/vncpasswd"
+VGLRUN="${CHATGPT_VGLRUN-/opt/VirtualGL/bin/vglrun}"   # empty = opt out of the GPU path
+NOVNC_PORT="${CHATGPT_NOVNC_PORT:-6080}"
+CHROME_DEB_URL="https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+TURBOVNC_KEY_URL="https://packagecloud.io/dcommander/turbovnc/gpgkey"
+TURBOVNC_LIST_URL="https://raw.githubusercontent.com/TurboVNC/repo/main/TurboVNC.list"
+VIRTUALGL_KEY_URL="https://packagecloud.io/dcommander/virtualgl/gpgkey"
+VIRTUALGL_LIST_URL="https://raw.githubusercontent.com/VirtualGL/repo/main/VirtualGL.list"
+UV_INSTALL_URL="https://astral.sh/uv/install.sh"
+
+MODE=install
+case "${1:-}" in
+  "") ;;
+  --check) MODE=check ;;
+  --login) MODE=login ;;
+  -h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
+  *) echo "chatgpt-setup: unknown option '$1' (try --help)" >&2; exit 64 ;;
+esac
+
+log() { echo "chatgpt-setup: $*" >&2; }
+die() { log "$*"; exit 1; }
+
+if [[ "$(id -u)" == 0 ]]; then
+  die "do not run as root; run as the unprivileged user that owns the browser profile (apt installs use sudo)"
+fi
+
+# ---------------------------------------------------------------------------------------
+# Platform gate
+# ---------------------------------------------------------------------------------------
+OS_NAME="$(uname -s)"
+ARCH="$(uname -m)"
+OS_RELEASE="${CHATGPT_OS_RELEASE:-/etc/os-release}"   # override exists for the test suite only
+OS_ID=""; OS_LIKE=""
+if [[ -r "$OS_RELEASE" ]]; then
+  OS_ID="$(. "$OS_RELEASE" && printf '%s' "${ID:-}")"
+  OS_LIKE="$(. "$OS_RELEASE" && printf '%s' "${ID_LIKE:-}")"
+fi
+is_debian_family() {
+  [[ "$OS_NAME" == "Linux" && "$ARCH" == "x86_64" ]] || return 1
+  [[ "$OS_ID" == "debian" || "$OS_ID" == "ubuntu" || " $OS_LIKE " == *" debian "* || " $OS_LIKE " == *" ubuntu "* ]]
+}
+if ! is_debian_family; then
+  log "automated setup covers Linux x86_64 with apt (Debian/Ubuntu) only; this host is ${OS_NAME}/${ARCH}${OS_ID:+ ($OS_ID)}"
+  log "install the items listed under 'Environment' in the README by hand"
+  exit 2
+fi
+
+# ---------------------------------------------------------------------------------------
+# Checks — each returns 0 when satisfied. Package checks go through dpkg-query so a host
+# can be probed without touching PATH; binaries with a known absolute path are checked
+# directly because that path is what bin/chatgpt hardcodes.
+# ---------------------------------------------------------------------------------------
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+have_pkg() { [[ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null)" == "install ok installed" ]]; }
+uv_bin() {
+  if have_cmd uv; then
+    command -v uv
+  elif [[ -x "$HOME/.local/bin/uv" ]]; then
+    printf '%s\n' "$HOME/.local/bin/uv"
+  else
+    return 1
+  fi
+}
+uv_playwright_python() {
+  local uv
+  uv="$(uv_bin)" || return 1
+  printf '%s\n' "$("$uv" tool dir 2>/dev/null)/playwright/bin/python"
+}
+have_playwright() {
+  if [[ -n "${CHATGPT_PYTHON:-}" ]]; then
+    "$CHATGPT_PYTHON" -c 'import playwright' >/dev/null 2>&1
+    return
+  fi
+  python3 -c 'import playwright' >/dev/null 2>&1 && return 0
+  local py; py="$(uv_playwright_python)" || return 1
+  [[ -x "$py" ]] && "$py" -c 'import playwright' >/dev/null 2>&1
+}
+has_nvidia_gpu() { nvidia-smi -L >/dev/null 2>&1; }
+chrome_gpu_mode() {
+  if [[ -n "$VGLRUN" && -x "$VGLRUN" ]] && has_nvidia_gpu; then
+    printf 'virtualgl\n'
+  else
+    printf 'software\n'
+  fi
+}
+
+# name | check | how it gets installed (for the report)
+CHECKS=(
+  "bash>=5      | (( BASH_VERSINFO[0] >= 5 ))                 | apt: bash"
+  "flock        | have_cmd flock                              | apt: util-linux"
+  "curl         | have_cmd curl                               | apt: curl"
+  "ss           | have_cmd ss                                 | apt: iproute2"
+  "gpg          | have_cmd gpg                                | apt: gnupg"
+  "python3      | have_cmd python3                            | apt: python3"
+  "openbox      | have_pkg openbox                            | apt: openbox"
+  "websockify   | have_pkg websockify                         | apt: websockify"
+  "novnc        | have_pkg novnc                              | apt: novnc"
+  "fonts-cjk    | have_pkg fonts-noto-cjk                     | apt: fonts-noto-cjk (ChatGPT UI in CJK locales)"
+  "turbovnc     | [[ -x \"\$VNCSERVER\" ]]                      | apt: turbovnc (packagecloud.io/dcommander/turbovnc)"
+  "chrome       | [[ -x \"\$CHROME_BIN\" ]]                     | google-chrome-stable .deb from dl.google.com"
+  "playwright   | have_playwright                             | uv is installed first when needed; uv tool install playwright (CDP only, no browser download)"
+  "profile-dir  | [[ -d \"\$PROFILE\" ]]                        | mkdir; then sign in via 'chatgpt-setup --login'"
+)
+
+# VirtualGL puts Chrome's WebGL on a real GPU. OpenAI's bot check treated the software
+# (SwiftShader) renderer as headless — the login hung after the password step — so on a
+# host with an NVIDIA GPU it is a dependency, not a nicety. Its EGL back end needs no X
+# server on the GPU; /dev/nvidia* is world-accessible on stock driver installs, so
+# vglserver_config is not required.
+VGL_NOTE=""
+if [[ -z "$VGLRUN" ]]; then
+  VGL_NOTE="virtualgl: skipped (CHATGPT_VGLRUN is empty — software WebGL)"
+elif has_nvidia_gpu; then
+  CHECKS+=("virtualgl    | [[ -x \"\$VGLRUN\" ]]                        | apt: virtualgl (packagecloud.io/dcommander/virtualgl) — GPU WebGL for Chrome")
+else
+  VGL_NOTE="virtualgl: skipped (no NVIDIA GPU: 'nvidia-smi -L' failed — software WebGL)"
+fi
+
+MISSING=()
+run_checks() {
+  local row name check how status
+  MISSING=()
+  [[ -n "$VGL_NOTE" ]] && log "$VGL_NOTE"
+  printf '%-13s %-8s %s\n' "dependency" "status" "source"
+  for row in "${CHECKS[@]}"; do
+    IFS='|' read -r name check how <<< "$row"
+    name="${name// /}"; how="${how# }"
+    if eval "$check" >/dev/null 2>&1; then status=OK; else status=MISSING; MISSING+=("$name"); fi
+    printf '%-13s %-8s %s\n' "$name" "$status" "$how"
+  done
+}
+
+# ---------------------------------------------------------------------------------------
+# Installers (Debian family). Each is idempotent and only runs when its check failed.
+# ---------------------------------------------------------------------------------------
+SUDO=()
+need_sudo() {
+  (( ${#SUDO[@]} )) && return 0
+  have_cmd sudo || die "sudo is required to install system packages"
+  if ! sudo -n true 2>/dev/null; then
+    log "sudo needs a password — run 'sudo -v' in this terminal first (in Claude Code: '! sudo -v'), then re-run"
+    exit 1
+  fi
+  SUDO=(sudo)
+}
+APT_UPDATED=0
+apt_install() {
+  need_sudo
+  if (( ! APT_UPDATED )); then
+    log "apt-get update"
+    "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get update -qq || die "apt-get update failed"
+    APT_UPDATED=1
+  fi
+  log "apt-get install $*"
+  "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" || die "apt-get install $* failed"
+}
+
+install_turbovnc() {
+  need_sudo
+  if [[ ! -f /etc/apt/sources.list.d/TurboVNC.list ]]; then
+    local tmp
+    tmp="$(mktemp)"
+    log "adding the TurboVNC apt repository"
+    curl -fsSL "$TURBOVNC_KEY_URL" | gpg --dearmor \
+      | "${SUDO[@]}" tee /etc/apt/trusted.gpg.d/TurboVNC.gpg >/dev/null || die "TurboVNC key download failed"
+    curl -fsSL -o "$tmp" "$TURBOVNC_LIST_URL" || { rm -f "$tmp"; die "TurboVNC.list download failed"; }
+    "${SUDO[@]}" install -m 644 "$tmp" /etc/apt/sources.list.d/TurboVNC.list \
+      || { rm -f "$tmp"; die "TurboVNC.list install failed"; }
+    rm -f "$tmp"
+    APT_UPDATED=0
+  fi
+  apt_install turbovnc
+}
+
+install_virtualgl() {
+  need_sudo
+  if [[ ! -f /etc/apt/sources.list.d/VirtualGL.list ]]; then
+    local tmp
+    tmp="$(mktemp)"
+    log "adding the VirtualGL apt repository"
+    curl -fsSL "$VIRTUALGL_KEY_URL" | gpg --dearmor \
+      | "${SUDO[@]}" tee /etc/apt/trusted.gpg.d/VirtualGL.gpg >/dev/null || die "VirtualGL key download failed"
+    curl -fsSL -o "$tmp" "$VIRTUALGL_LIST_URL" || { rm -f "$tmp"; die "VirtualGL.list download failed"; }
+    "${SUDO[@]}" install -m 644 "$tmp" /etc/apt/sources.list.d/VirtualGL.list \
+      || { rm -f "$tmp"; die "VirtualGL.list install failed"; }
+    rm -f "$tmp"
+    APT_UPDATED=0
+  fi
+  apt_install virtualgl
+}
+
+install_chrome() {
+  need_sudo
+  local tmp deb
+  tmp="$(mktemp -d)"
+  deb="$tmp/google-chrome-stable_current_amd64.deb"
+  log "downloading Google Chrome (~120 MB)"
+  curl -fL --progress-bar -o "$deb" "$CHROME_DEB_URL" || { rm -rf "$tmp"; die "Chrome download failed"; }
+  # `apt-get install ./file.deb` pulls the dependencies (fonts, libgbm, …) that dpkg -i cannot.
+  apt_install "$deb"
+  rm -rf "$tmp"
+}
+
+install_uv() {
+  log "installing uv into ~/.local/bin"
+  curl -LsSf "$UV_INSTALL_URL" | sh || die "uv install failed"
+  uv_bin >/dev/null || die "uv install did not create an executable at ~/.local/bin/uv"
+}
+
+install_playwright() {
+  local uv
+  uv="$(uv_bin)" || { install_uv; uv="$(uv_bin)" || die "uv is unavailable after install"; }
+  log "uv tool install playwright"
+  "$uv" tool install playwright || die "uv tool install playwright failed"
+}
+
+install_platform() {
+  local -a pkgs=()
+  local name
+  for name in "$@"; do
+    case "$name" in
+      "bash>=5")    pkgs+=(bash) ;;
+      flock)        pkgs+=(util-linux) ;;
+      curl)         pkgs+=(curl) ;;
+      ss)           pkgs+=(iproute2) ;;
+      gpg)          pkgs+=(gnupg) ;;
+      python3)      pkgs+=(python3) ;;
+      openbox)      pkgs+=(openbox) ;;
+      websockify)   pkgs+=(websockify) ;;
+      novnc)        pkgs+=(novnc) ;;
+      fonts-cjk)    pkgs+=(fonts-noto-cjk) ;;
+    esac
+  done
+  (( ${#pkgs[@]} )) && apt_install "${pkgs[@]}"
+  for name in "$@"; do
+    case "$name" in
+      turbovnc)     install_turbovnc ;;
+      chrome)       install_chrome ;;
+      virtualgl)    install_virtualgl ;;
+      playwright)   install_playwright ;;
+      profile-dir)  mkdir -p "$PROFILE"; log "created $PROFILE (empty — sign in with 'chatgpt-setup --login')" ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------------------
+# Login helper: reuse bin/chatgpt's own stack bring-up (CHATGPT_STACK_ONLY=1) so the exact
+# code path a real run takes is what gets exercised, then hand the user a noVNC URL + OTP.
+# ---------------------------------------------------------------------------------------
+do_login() {
+  local recorded_gpu wanted_gpu
+  recorded_gpu="$(sed -n -e 's/^CHROME_GPU=virtualgl$/virtualgl/p' \
+    -e 's/^CHROME_GPU=software$/software/p' "$STATE_DIR/stack.env" 2>/dev/null | head -1)"
+  wanted_gpu="$(chrome_gpu_mode)"
+  if curl -sf --max-time 3 "http://127.0.0.1:${CHATGPT_CDP_PORT:-9222}/json/version" \
+      | grep -Eq '"Browser"[[:space:]]*:[[:space:]]*"(Chrome|Chromium|HeadlessChrome|Edg|Comet)' \
+      && [[ "$recorded_gpu" != "$wanted_gpu" ]]; then
+    log "Chrome GPU mode changed (${recorded_gpu:-unrecorded} -> $wanted_gpu); restarting the profile Chrome"
+    pkill -f -- "user-data-dir=$PROFILE" 2>/dev/null || true
+    sleep 2
+  fi
+  CHATGPT_STACK_ONLY=1 CHATGPT_LOCK_WAIT="${CHATGPT_LOCK_WAIT:-30}" "$BIN_DIR/chatgpt" \
+    || die "stack bring-up failed (see messages above; logs under $STATE_DIR)"
+  local display otp
+  display="$(sed -n 's/^VNC_DISPLAY=\(:[0-9][0-9]*\)$/\1/p' "$STATE_DIR/stack.env" 2>/dev/null | head -1)"
+  [[ -n "$display" ]] || die "no VNC_DISPLAY in $STATE_DIR/stack.env"
+  otp="$("$VNCPASSWD" -o -display "$display" 2>&1 | sed -n 's/.*password: *//p' | head -1)"
+  [[ -n "$otp" ]] || die "could not generate a one-time password with $VNCPASSWD -o -display $display"
+  cat <<EOF
+
+noVNC is listening on 127.0.0.1:${NOVNC_PORT} (VNC display ${display}). From your workstation:
+
+  ssh -N -L ${NOVNC_PORT}:127.0.0.1:${NOVNC_PORT} $(id -un)@$(hostname)
+  open http://localhost:${NOVNC_PORT}/vnc.html?autoconnect=1&password=${otp}
+
+The password is a TurboVNC one-time password (valid for a single connection; run
+'chatgpt-setup --login' again for a fresh one). Sign in to chatgpt.com in the Chrome
+window, then run any 'chatgpt "…"' — the profile at
+  ${PROFILE}
+keeps the session.
+EOF
+}
+
+# ---------------------------------------------------------------------------------------
+case "$MODE" in
+  check)
+    run_checks
+    if (( ${#MISSING[@]} )); then
+      log "missing: ${MISSING[*]} — run 'chatgpt-setup' to install"
+      exit 1
+    fi
+    log "all dependencies present"
+    ;;
+  install)
+    run_checks
+    if (( ${#MISSING[@]} )); then
+      log "installing: ${MISSING[*]}"
+      install_platform "${MISSING[@]}"
+      echo
+      run_checks
+      (( ${#MISSING[@]} )) && die "still missing after install: ${MISSING[*]}"
+    fi
+    log "all dependencies present"
+    if [[ -z "$(ls -A "$PROFILE" 2>/dev/null)" ]]; then
+      log "the browser profile is empty — run 'chatgpt-setup --login' and sign in to chatgpt.com"
+    fi
+    ;;
+  login)
+    mkdir -p "$PROFILE"
+    run_checks
+    (( ${#MISSING[@]} )) && die "missing: ${MISSING[*]} — run 'chatgpt-setup' first"
+    do_login
+    ;;
+esac

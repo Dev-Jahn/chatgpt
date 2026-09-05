@@ -3,7 +3,11 @@ name: chatgpt
 description: Delegate ultra-hard analysis/design/research/verification tasks (tens of minutes+) to subscription ChatGPT Pro (GPT-6 Pro — Chat mode, Latest model at Pro effort, verified before sending). Just pass a prompt — no packing or templates; ask for authenticated connectors (GitHub etc.) directly in the prompt.
 ---
 
-The plugin's `bin/` is on PATH — call `chatgpt` directly.
+The plugin's `bin/` is on PATH — call `chatgpt` directly. If it fails on a
+missing dependency or a login page, `chatgpt-setup --check` shows what is
+missing, `chatgpt-setup` installs it (Linux x86_64 / Debian-family apt only),
+and `chatgpt-setup --login` starts the browser stack and prints a noVNC URL +
+one-time password for the user to sign in with.
 
 ```bash
 chatgpt "your question"
