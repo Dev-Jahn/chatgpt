@@ -16,7 +16,8 @@ echo "your question" | chatgpt -
 ```
 
 Long-running by nature — invoke with `run_in_background`. Up to a few runs
-execute concurrently; excess waits on a lock. stdout is the response body only.
+execute concurrently; excess waits on a lock. stdout is the response body
+followed by a `Conversation: <url>` trailer (see Follow-ups).
 The model is fixed (Chat mode · Latest · Pro, shown as `6 Pro`); `--effort
 instant|medium|high|extra high` lowers the reasoning effort when a Pro-length
 wait is not warranted. Exit codes: 0 = success,
@@ -28,3 +29,8 @@ Chats are grouped under a per-folder ChatGPT project named `<folder> · <hash8>`
 (hash of the cwd, so same-named folders stay separate) instead of piling up in
 the root chat list. `--project NAME` picks an explicit project; `--no-project`
 opts out. Any project failure falls back to a plain chat — never an abort.
+
+Follow-ups: every reply ends with a trailer naming its conversation URL. When
+the next request builds on that answer (same topic, more detail, a correction),
+pass `--continue <that url>` so the prompt lands in the same thread with its
+context retained; otherwise omit it and a fresh chat is started.

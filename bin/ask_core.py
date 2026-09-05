@@ -20,7 +20,7 @@ import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Sequence, TextIO
+from typing import Callable, NamedTuple, Sequence, TextIO
 
 try:
     from playwright.sync_api import sync_playwright
@@ -88,6 +88,7 @@ QUOTA_HINTS = [
     "요금제를 업그레이드",
 ]
 CONV_URL_RE = re.compile(r"/c/[0-9a-f]{8}[0-9a-f-]{4,}", re.I)
+CONVERSATION_ID_RE = re.compile(r"^[0-9a-f]{8}[0-9a-f-]{4,}$", re.I)
 STABLE_SECS = 4
 STATUS_INTERVAL = 15
 # Project grouping (ported from insane-review's pack_and_ask.py). The /g/g-p- URL mark and
@@ -118,6 +119,11 @@ class SentUnknownLocationError(Exception):
 
 class RateLimitedError(Exception):
     pass
+
+
+class Reply(NamedTuple):
+    body: str
+    conversation_url: str
 
 
 class UsageParser(argparse.ArgumentParser):
@@ -151,6 +157,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="start a plain chat instead of grouping under a project",
     )
+    parser.add_argument(
+        "--continue",
+        dest="conversation",
+        metavar="CONVERSATION",
+        help="follow up inside an existing conversation (its chatgpt.com URL or bare id); "
+        "the thread's context is retained and project grouping does not apply",
+    )
     return parser
 
 
@@ -165,6 +178,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         raise UsageError("choose either --project or --no-project, not both")
     if args.project is not None and not args.project.strip():
         raise UsageError("--project must not be empty")
+    if args.conversation is not None:
+        if args.project is not None or args.no_project:
+            raise UsageError(
+                "--continue reopens an existing conversation; --project/--no-project do not apply"
+            )
+        args.conversation = conversation_url(args.conversation)
     return args
 
 
@@ -188,6 +207,30 @@ def response_path(given: Path | None) -> Path:
         return given.expanduser().resolve()
     stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
     return (Path.home() / ".chatgpt" / "out" / f"{stamp}.md").resolve()
+
+
+def conversation_url(text: str) -> str:
+    """Normalize --continue: a chatgpt.com conversation URL is kept as given (a project chat lives
+    under /g/g-p-…/c/<id>; ChatGPT resolves the bare /c/<id> form to it as well), a bare id
+    becomes https://chatgpt.com/c/<id>."""
+    value = text.strip().rstrip("/")
+    if CONVERSATION_ID_RE.match(value):
+        return f"{CHATGPT_URL}c/{value}"
+    if CONV_URL_RE.search(value):
+        return value if re.match(r"https?://", value, re.I) else f"https://{value}"
+    raise UsageError(
+        f"--continue expects a chatgpt.com conversation URL (…/c/<id>) or the bare id, got {text!r}"
+    )
+
+
+def conversation_trailer(url: str) -> str:
+    """Printed after every reply so the calling agent learns that it can follow up in-thread."""
+    return (
+        "---\n"
+        f"Conversation: {url}\n"
+        "To continue this thread with a follow-up (its context is retained), pass "
+        f"`--continue {url}` on the next `chatgpt` call. Omit it to start a fresh chat."
+    )
 
 
 def atomic_write(path: Path, text: str) -> None:
@@ -535,6 +578,44 @@ def enter_project(page, name: str) -> bool:
             return True
         time.sleep(1)
     return False
+
+
+# --- follow-ups in an existing conversation --------------------------------------------
+
+
+def conversation_key(url: str) -> str:
+    match = CONV_URL_RE.search(url)
+    return match.group(0) if match else ""
+
+
+def dialog_text(page) -> str:
+    try:
+        for surface in page.query_selector_all('[role="dialog"]'):
+            text = normalize(surface.inner_text())
+            if text:
+                return text[:160]
+    except Exception:
+        pass
+    return ""
+
+
+def open_conversation(page, url: str) -> str:
+    """Land on an existing conversation and return the URL the page settles on (ChatGPT rewrites
+    a bare /c/<id> to its project form). A deleted or foreign conversation bounces to the home
+    page behind an access dialog (measured 2026-09-05), so a page that never shows the id with
+    a composer is reported here, before anything is typed."""
+    key = conversation_key(url)
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    for _ in range(15):
+        time.sleep(1)
+        landed = current_url(page)
+        if key.casefold() in landed.casefold() and find_input(page) is not None:
+            return landed
+    dialog = dialog_text(page)
+    raise RuntimeError(
+        f"conversation {key} is not reachable; the page settled on {current_url(page)}"
+        + (f" ({dialog})" if dialog else "")
+    )
 
 
 # --- rate-limit modal ------------------------------------------------------------------
@@ -947,17 +1028,25 @@ def release_submit_lock() -> None:
     log("submit lock released")
 
 
-def confirm_sent_and_capture(page, base_user: int) -> str:
+def confirm_sent_and_capture(page, base_user: int, bound_url: str | None = None) -> str:
+    """Wait for the send to register, then return the conversation URL. In a fresh chat the URL
+    flipping to /c/<id> is as good as a new user turn; when following up (bound_url) the page
+    already carries that URL, so only the new user turn counts."""
     deadline = time.monotonic() + 45
     sent = False
     while time.monotonic() < deadline:
-        url = current_url(page)
-        if count_nodes(page, USER_MSG_SELECTORS) > base_user or CONV_URL_RE.search(url):
+        if count_nodes(page, USER_MSG_SELECTORS) > base_user:
+            sent = True
+            break
+        if bound_url is None and CONV_URL_RE.search(current_url(page)):
             sent = True
             break
         time.sleep(1)
     if not sent:
         raise RuntimeError("no new user turn appeared after send")
+    if bound_url is not None:
+        log(f"conversation bound: {bound_url}")
+        return bound_url
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
         url = current_url(page)
@@ -1070,13 +1159,29 @@ def assistant_markdown(node) -> str:
             return ""
 
 
-def turn_complete(page, base_assistant: int) -> bool:
+# Climb from a message to its own turn container: the first ancestor that holds a copy action.
+# Should that ancestor hold other messages too, the copy action belongs to an earlier turn.
+TURN_HAS_COPY_JS = """el => {
+  const copy = %s;
+  let node = el;
+  for (let hop = 0; hop < 8 && node; hop++) {
+    if (node.querySelector(copy)) return node.querySelectorAll('[data-message-author-role]').length <= 1;
+    node = node.parentElement;
+  }
+  return false;
+}""" % json.dumps(", ".join(COPY_BTN_SELECTORS))
+
+
+def turn_complete(page, node) -> bool:
+    """The fresh assistant turn is done once nothing streams and its own turn carries the copy
+    action. A page-wide copy count would be satisfied too early: earlier turns keep their
+    buttons (a follow-up inherits all of them) and the user's own turn carries one as well."""
     if is_streaming(page):
         return False
-    return (
-        count_nodes(page, ASSISTANT_MSG_SELECTORS) > base_assistant
-        and count_nodes(page, COPY_BTN_SELECTORS) > 0
-    )
+    try:
+        return bool(node.evaluate(TURN_HAS_COPY_JS))
+    except Exception:
+        return False
 
 
 def wait_for_response(
@@ -1086,14 +1191,13 @@ def wait_for_response(
     base_assistant: int,
     deadline: float,
 ) -> str:
-    match = CONV_URL_RE.search(conversation_url)
-    conversation_key = match.group(0) if match else ""
+    key = conversation_key(conversation_url)
     stable_since = None
     previous = ""
     last_status = -STATUS_INTERVAL
     log(f"waiting for response (up to {max(0, int(deadline - time.monotonic()))}s)")
     while time.monotonic() < deadline:
-        if conversation_key not in current_url(page):
+        if key not in current_url(page):
             log("conversation drift detected; returning to the bound URL")
             page.goto(conversation_url, wait_until="domcontentloaded", timeout=60000)
             stable_since = None
@@ -1105,7 +1209,7 @@ def wait_for_response(
             log(f"response {status}; {remaining}s remaining")
             last_status = remaining // STATUS_INTERVAL
         node = fresh_assistant_node(page, base_ids, base_assistant)
-        if node is None or not turn_complete(page, base_assistant):
+        if node is None or not turn_complete(page, node):
             # The prompt is already in flight here: a throttle now blocks only the
             # harvest, so the error must carry the conversation URL for a later pickup.
             raise_if_rate_limited(
@@ -1142,7 +1246,8 @@ def ask(
     attach: Path | None,
     max_wait: int,
     project: str | None = None,
-) -> str:
+    conversation: str | None = None,
+) -> Reply:
     if sync_playwright is None:
         raise RuntimeError(
             "Python package 'playwright' is required "
@@ -1169,7 +1274,11 @@ def ask(
                 raise RuntimeError(f"ChatGPT session unavailable: {detail}")
             raise_if_rate_limited(page, "rate limited before submit; nothing sent")
 
-            if project:
+            bound_url = None
+            if conversation:
+                bound_url = open_conversation(page, conversation)
+                log(f"following up in conversation: {bound_url}")
+            elif project:
                 if enter_project(page, project):
                     log(f"chat grouped under project {project!r}: {current_url(page)}")
                 else:
@@ -1196,19 +1305,20 @@ def ask(
                     raise RuntimeError("prompt did not enter the composer intact")
             raise_if_rate_limited(page, "rate limited before submit; nothing sent")
             click_send(page)
-            conversation_url = confirm_sent_and_capture(page, base_user)
+            conversation_url = confirm_sent_and_capture(page, base_user, bound_url)
             release_submit_lock()
             deadline = time.monotonic() + max_wait
 
             for attempt in range(2):
                 try:
-                    return wait_for_response(
+                    body = wait_for_response(
                         page,
                         conversation_url,
                         base_ids,
                         base_assistant,
                         deadline,
                     )
+                    return Reply(body, conversation_url)
                 except (ResponseTimeoutError, RateLimitedError):
                     raise  # neither gets better by reloading the page right away
                 except Exception as exc:
@@ -1235,7 +1345,7 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     stdin: TextIO | None = None,
-    ask_fn: Callable[..., str] = ask,
+    ask_fn: Callable[..., Reply] = ask,
 ) -> int:
     try:
         args = parse_args(argv)
@@ -1243,21 +1353,24 @@ def main(
         if args.attach is not None and not args.attach.expanduser().is_file():
             raise UsageError(f"attachment is not a file: {args.attach}")
         output = response_path(args.out)
-        project = None if args.no_project else (args.project or default_project_name())
-        response = ask_fn(
+        project = None
+        if not args.no_project and args.conversation is None:
+            project = args.project or default_project_name()
+        reply = ask_fn(
             prompt,
             effort=args.effort,
             attach=args.attach,
             max_wait=args.max_wait,
             project=project,
-        ).strip()
-        if not response:
+            conversation=args.conversation,
+        )
+        body = reply.body.strip()
+        if not body:
             raise RuntimeError("harvested response is empty")
-        atomic_write(output, response + "\n")
-        if args.quiet:
-            print(output)
-        else:
-            print(response)
+        atomic_write(output, body + "\n")  # the saved file is the pure response
+        print(output if args.quiet else body)
+        print()
+        print(conversation_trailer(reply.conversation_url))
         return 0
     except UsageError as exc:
         print(f"chatgpt: {exc}", file=sys.stderr)

@@ -19,6 +19,13 @@ sys.path.insert(0, str(ROOT / "bin"))
 
 import ask_core  # noqa: E402
 
+CONV = "https://chatgpt.com/g/g-p-6a9b861a83d48191ba6b3bd85b197802/c/6a9b8621-0250-83ee-93ed-50f50ee5d7bd"
+TRAILER = ask_core.conversation_trailer(CONV)
+
+
+def answer(*_args, **_kwargs):
+    return ask_core.Reply("answer", CONV)
+
 
 class ParsingTests(unittest.TestCase):
     def test_positional_defaults(self):
@@ -82,23 +89,19 @@ class ExitCodeTests(unittest.TestCase):
     def test_success_prints_body_and_saves_file(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "answer.md"
-            code, stdout, stderr = self.run_main(
-                ["--out", str(output), "hello"], lambda *_args, **_kwargs: "answer"
-            )
+            code, stdout, stderr = self.run_main(["--out", str(output), "hello"], answer)
             self.assertEqual(code, 0)
-            self.assertEqual(stdout, "answer\n")
+            self.assertEqual(stdout, f"answer\n\n{TRAILER}\n")
             self.assertEqual(stderr, "")
             self.assertEqual(output.read_text(encoding="utf-8"), "answer\n")
 
-    def test_quiet_prints_only_path(self):
+    def test_quiet_prints_path_then_trailer(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "answer.md"
-            code, stdout, _ = self.run_main(
-                ["--quiet", "--out", str(output), "hello"],
-                lambda *_args, **_kwargs: "answer",
-            )
+            code, stdout, _ = self.run_main(["--quiet", "--out", str(output), "hello"], answer)
             self.assertEqual(code, 0)
-            self.assertEqual(stdout, f"{output.resolve()}\n")
+            self.assertEqual(stdout, f"{output.resolve()}\n\n{TRAILER}\n")
+            self.assertEqual(output.read_text(encoding="utf-8"), "answer\n")
 
 
 class ComposerTests(unittest.TestCase):
@@ -112,19 +115,19 @@ class ComposerTests(unittest.TestCase):
 
 
 class ResponseCompletionTests(unittest.TestCase):
-    def test_fresh_turn_with_copy_action_is_complete(self):
-        def count(_page, selectors):
-            if selectors == ask_core.ASSISTANT_MSG_SELECTORS:
-                return 1
-            if selectors == ask_core.COPY_BTN_SELECTORS:
-                return 2
-            return 0
-
-        with mock.patch.object(ask_core, "is_streaming", return_value=False), mock.patch.object(
-            ask_core, "count_nodes", side_effect=count
-        ):
-            self.assertTrue(ask_core.turn_complete(mock.Mock(), base_assistant=0))
-            self.assertFalse(ask_core.turn_complete(mock.Mock(), base_assistant=1))
+    def test_turn_is_complete_only_when_its_own_turn_shows_the_copy_action(self):
+        """Older turns (and the user's own turn) keep copy buttons, so completion is decided
+        on the fresh assistant node's turn, never on a page-wide count."""
+        node = mock.Mock()
+        with mock.patch.object(ask_core, "is_streaming", return_value=False):
+            node.evaluate.return_value = True
+            self.assertTrue(ask_core.turn_complete(mock.Mock(), node))
+            node.evaluate.return_value = False
+            self.assertFalse(ask_core.turn_complete(mock.Mock(), node))
+            self.assertEqual(node.evaluate.call_args[0][0], ask_core.TURN_HAS_COPY_JS)
+        with mock.patch.object(ask_core, "is_streaming", return_value=True):
+            node.evaluate.return_value = True
+            self.assertFalse(ask_core.turn_complete(mock.Mock(), node))
 
 
 class EffortArgTests(unittest.TestCase):
@@ -329,6 +332,108 @@ class ModelPickerTests(unittest.TestCase):
             self.select(page)
         self.assertIn("GPT-5.5", str(caught.exception))
         self.assertEqual(page.tick_clicks, [])
+
+
+class ContinueArgTests(unittest.TestCase):
+    ID = "6a9b8621-0250-83ee-93ed-50f50ee5d7bd"
+
+    def test_conversation_forms_normalize_to_a_url(self):
+        self.assertEqual(ask_core.parse_args(["--continue", CONV, "hi"]).conversation, CONV)
+        self.assertEqual(
+            ask_core.parse_args(["--continue", self.ID, "hi"]).conversation,
+            f"https://chatgpt.com/c/{self.ID}",
+        )
+        self.assertEqual(
+            ask_core.parse_args(["--continue", f"chatgpt.com/c/{self.ID}/", "hi"]).conversation,
+            f"https://chatgpt.com/c/{self.ID}",
+        )
+        self.assertIsNone(ask_core.parse_args(["hi"]).conversation)
+
+    def test_garbage_and_project_flags_are_usage_errors(self):
+        for bad in ("not-a-conversation", "https://chatgpt.com/", "", "  "):
+            with self.assertRaises(ask_core.UsageError):
+                ask_core.parse_args(["--continue", bad, "hi"])
+        with self.assertRaises(ask_core.UsageError):
+            ask_core.parse_args(["--continue", self.ID, "--project", "Docs", "hi"])
+        with self.assertRaises(ask_core.UsageError):
+            ask_core.parse_args(["--continue", self.ID, "--no-project", "hi"])
+
+    def test_main_passes_the_conversation_and_no_project(self):
+        seen = {}
+
+        def capture(_prompt, **kwargs):
+            seen.update(kwargs)
+            return ask_core.Reply("answer", CONV)
+
+        with contextlib.redirect_stdout(io.StringIO()), tempfile.TemporaryDirectory() as directory:
+            out = str(Path(directory) / "a.md")
+            code = ask_core.main(
+                ["--out", out, "--continue", self.ID, "hello"], stdin=io.StringIO(), ask_fn=capture
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["conversation"], f"https://chatgpt.com/c/{self.ID}")
+        self.assertIsNone(seen["project"])
+
+
+class ContinuationFlowTests(unittest.TestCase):
+    def test_trailer_names_the_conversation_and_the_option(self):
+        self.assertEqual(
+            TRAILER.splitlines(),
+            [
+                "---",
+                f"Conversation: {CONV}",
+                "To continue this thread with a follow-up (its context is retained), pass "
+                f"`--continue {CONV}` on the next `chatgpt` call. Omit it to start a fresh chat.",
+            ],
+        )
+
+    def test_follow_up_send_is_confirmed_by_a_new_user_turn_only(self):
+        counts = iter([1, 1, 2])
+        with mock.patch.object(ask_core, "count_nodes", side_effect=lambda *_: next(counts)), mock.patch.object(
+            ask_core, "current_url", return_value=CONV
+        ), mock.patch.object(ask_core.time, "sleep"):
+            self.assertEqual(ask_core.confirm_sent_and_capture(mock.Mock(), 1, CONV), CONV)
+
+    def test_follow_up_never_takes_the_bound_url_as_proof_of_sending(self):
+        """In a fresh chat the URL flipping to /c/<id> proves the send; a follow-up page carries
+        that URL from the start, so the same shortcut would report a send that never happened."""
+        import itertools
+
+        clock = itertools.count(0, 10)
+        with mock.patch.object(ask_core, "count_nodes", return_value=1), mock.patch.object(
+            ask_core, "current_url", return_value=CONV
+        ), mock.patch.object(ask_core.time, "sleep"), mock.patch.object(
+            ask_core.time, "monotonic", side_effect=lambda: next(clock)
+        ):
+            with self.assertRaises(RuntimeError):
+                ask_core.confirm_sent_and_capture(mock.Mock(), 1, CONV)
+        with mock.patch.object(ask_core, "count_nodes", return_value=0), mock.patch.object(
+            ask_core, "current_url", return_value=CONV
+        ), mock.patch.object(ask_core.time, "sleep"):
+            self.assertEqual(ask_core.confirm_sent_and_capture(mock.Mock(), 0), CONV)
+
+    def test_open_conversation_returns_the_url_the_page_settles_on(self):
+        page = mock.Mock()
+        page.evaluate.return_value = CONV  # a bare /c/<id> request is rewritten to the project form
+        page.query_selector.return_value = mock.Mock()  # composer present
+        with mock.patch.object(ask_core.time, "sleep"):
+            landed = ask_core.open_conversation(page, "https://chatgpt.com/c/6a9b8621-0250-83ee-93ed-50f50ee5d7bd")
+        self.assertEqual(landed, CONV)
+        page.goto.assert_called_once()
+
+    def test_bounced_conversation_is_reported_before_anything_is_typed(self):
+        page = mock.Mock()
+        page.evaluate.return_value = "https://chatgpt.com/"  # bounced home
+        dialog = mock.Mock()
+        dialog.inner_text.return_value = "이 대화에 접근할 수 없습니다."
+        page.query_selector_all.return_value = [dialog]
+        page.query_selector.return_value = mock.Mock()
+        with mock.patch.object(ask_core.time, "sleep"):
+            with self.assertRaises(RuntimeError) as caught:
+                ask_core.open_conversation(page, "https://chatgpt.com/c/00000000-0000-4000-8000-000000000000")
+        self.assertIn("not reachable", str(caught.exception))
+        self.assertIn("접근할 수 없습니다", str(caught.exception))
+        page.keyboard.insert_text.assert_not_called()
 
 
 @contextlib.contextmanager
@@ -645,13 +750,14 @@ class ProjectNameTests(unittest.TestCase):
 
         def capture(_prompt, **kwargs):
             seen.update(kwargs)
-            return "answer"
+            return ask_core.Reply("answer", CONV)
 
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout), tempfile.TemporaryDirectory() as directory:
             out = str(Path(directory) / "a.md")
-            ask_core.main(["--out", out, "hello"], stdin=io.StringIO(), ask_fn=capture)
+            self.assertEqual(ask_core.main(["--out", out, "hello"], stdin=io.StringIO(), ask_fn=capture), 0)
             self.assertEqual(seen["project"], ask_core.default_project_name())
+            self.assertIsNone(seen["conversation"])
             ask_core.main(["--out", out, "--project", "Docs", "hello"], stdin=io.StringIO(), ask_fn=capture)
             self.assertEqual(seen["project"], "Docs")
             ask_core.main(["--out", out, "--no-project", "hello"], stdin=io.StringIO(), ask_fn=capture)

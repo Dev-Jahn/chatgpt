@@ -44,11 +44,19 @@ chatgpt "your question"
 chatgpt -f prompt.md
 echo "your question" | chatgpt -
 chatgpt --effort pro --attach context.pdf --max-wait 7200 --out answer.md "question"
+chatgpt --continue https://chatgpt.com/c/<id> "follow-up question"
 ```
 
-- stdout carries the response body only; progress and diagnostics go to
-  stderr. `--quiet` prints just the saved-file path. Responses are also saved
-  under `~/.chatgpt/out/<timestamp>.md`.
+- stdout carries the response body, then a blank line and a short trailer
+  (`---`, `Conversation: <url>`, and one sentence on how to continue it);
+  progress and diagnostics go to stderr. `--quiet` replaces the body with the
+  saved-file path but keeps the trailer. The saved file (`--out`, default
+  `~/.chatgpt/out/<timestamp>.md`) holds the body only.
+- `--continue <url-or-id>` reopens that conversation and appends the prompt
+  there, so the thread's context is retained — use it when the next request
+  builds on the previous answer. Project grouping does not apply to a
+  follow-up (`--project`/`--no-project` are rejected alongside it). A deleted
+  or foreign conversation is reported before anything is typed (exit 1).
 - Up to a few runs execute concurrently; excess waits on a lock for up to
   `CHATGPT_LOCK_WAIT` seconds (default 3600).
 - `--effort` takes one of the five slider positions `instant`, `medium`,
