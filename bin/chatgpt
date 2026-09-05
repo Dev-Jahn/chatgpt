@@ -8,8 +8,18 @@ CORE="$BIN_DIR/ask_core.py"
 # system python3 when it can import playwright, then the isolated venv that
 # `uv tool install playwright` creates (PEP 668 hosts such as Debian/Ubuntu refuse a
 # plain `pip install`). Falls back to python3 so ask_core reports the missing package.
+uv_bin() {
+  if command -v uv >/dev/null 2>&1; then
+    command -v uv
+  elif [[ -x "$HOME/.local/bin/uv" ]]; then
+    printf '%s\n' "$HOME/.local/bin/uv"
+  else
+    return 1
+  fi
+}
+
 resolve_python() {
-  local candidate
+  local candidate uv
   if [[ -n "${CHATGPT_PYTHON:-}" ]]; then
     printf '%s\n' "$CHATGPT_PYTHON"
     return 0
@@ -18,8 +28,8 @@ resolve_python() {
     printf 'python3\n'
     return 0
   fi
-  if command -v uv >/dev/null 2>&1; then
-    candidate="$(uv tool dir 2>/dev/null)/playwright/bin/python"
+  if uv="$(uv_bin)"; then
+    candidate="$("$uv" tool dir 2>/dev/null)/playwright/bin/python"
     if [[ -x "$candidate" ]]; then
       printf '%s\n' "$candidate"
       return 0
@@ -60,6 +70,14 @@ if [[ "$OS_NAME" == "Darwin" ]]; then
 else
   CHROME_BIN="${CHATGPT_CHROME_BIN:-/usr/bin/google-chrome}"
 fi
+
+chrome_gpu_mode() {
+  if [[ -n "$VGLRUN" && -x "$VGLRUN" ]] && nvidia-smi -L >/dev/null 2>&1; then
+    printf 'virtualgl\n'
+  else
+    printf 'software\n'
+  fi
+}
 
 mkdir -p "$STATE_DIR" "$STATE_DIR/out" "$STATE_DIR/slots"
 
@@ -287,7 +305,7 @@ start_chrome() {
   local gpu_mode=""
   if [[ "$OS_NAME" != "Darwin" ]]; then
     display_env=(env "DISPLAY=$VNC_DISPLAY")
-    if [[ -n "$VGLRUN" && -x "$VGLRUN" ]]; then
+    if [[ "$CHROME_GPU" == "virtualgl" ]]; then
       gl_prefix=("$VGLRUN" -d egl)
       gpu_flags=(--ignore-gpu-blocklist --disable-gpu-sandbox)
       gpu_mode=" (GPU via VirtualGL)"
@@ -345,6 +363,9 @@ if [[ "$OS_NAME" == "Darwin" ]]; then
     echo "CDP_PORT=$CDP_PORT"
   } > "$STATE"
 else
+  CHROME_GPU="$(sed -n -e 's/^CHROME_GPU=virtualgl$/virtualgl/p' \
+    -e 's/^CHROME_GPU=software$/software/p' "$STATE" 2>/dev/null | head -1)"
+  DESIRED_CHROME_GPU="$(chrome_gpu_mode)"
   VNC_DISPLAY="$(read_display_from_state "$STATE" || true)"
   if [[ -z "$VNC_DISPLAY" ]]; then
     VNC_DISPLAY="$(my_vnc_display || true)"
@@ -353,6 +374,7 @@ else
   if cdp_up; then
     echo "chatgpt: reusing Chrome CDP $CDP_PORT" >&2
   else
+    CHROME_GPU="$DESIRED_CHROME_GPU"
     start_vnc || exit 1
     start_chrome || exit 1
   fi
@@ -372,6 +394,7 @@ else
     echo "VNC_DISPLAY=$VNC_DISPLAY"
     echo "NOVNC_PORT=$NOVNC_PORT"
     echo "CDP_PORT=$CDP_PORT"
+    [[ -n "$CHROME_GPU" ]] && echo "CHROME_GPU=$CHROME_GPU"
   } > "$STATE"
 fi
 

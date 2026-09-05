@@ -38,6 +38,10 @@ esac
 log() { echo "chatgpt-setup: $*" >&2; }
 die() { log "$*"; exit 1; }
 
+if [[ "$(id -u)" == 0 ]]; then
+  die "do not run as root; run as the unprivileged user that owns the browser profile (apt installs use sudo)"
+fi
+
 # ---------------------------------------------------------------------------------------
 # Platform gate
 # ---------------------------------------------------------------------------------------
@@ -66,16 +70,37 @@ fi
 # ---------------------------------------------------------------------------------------
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 have_pkg() { [[ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null)" == "install ok installed" ]]; }
-uv_playwright_python() { have_cmd uv && printf '%s\n' "$(uv tool dir 2>/dev/null)/playwright/bin/python"; }
+uv_bin() {
+  if have_cmd uv; then
+    command -v uv
+  elif [[ -x "$HOME/.local/bin/uv" ]]; then
+    printf '%s\n' "$HOME/.local/bin/uv"
+  else
+    return 1
+  fi
+}
+uv_playwright_python() {
+  local uv
+  uv="$(uv_bin)" || return 1
+  printf '%s\n' "$("$uv" tool dir 2>/dev/null)/playwright/bin/python"
+}
 have_playwright() {
   if [[ -n "${CHATGPT_PYTHON:-}" ]]; then
-    "$CHATGPT_PYTHON" -c 'import playwright' >/dev/null 2>&1 && return 0
+    "$CHATGPT_PYTHON" -c 'import playwright' >/dev/null 2>&1
+    return
   fi
   python3 -c 'import playwright' >/dev/null 2>&1 && return 0
   local py; py="$(uv_playwright_python)" || return 1
   [[ -x "$py" ]] && "$py" -c 'import playwright' >/dev/null 2>&1
 }
 has_nvidia_gpu() { nvidia-smi -L >/dev/null 2>&1; }
+chrome_gpu_mode() {
+  if [[ -n "$VGLRUN" && -x "$VGLRUN" ]] && has_nvidia_gpu; then
+    printf 'virtualgl\n'
+  else
+    printf 'software\n'
+  fi
+}
 
 # name | check | how it gets installed (for the report)
 CHECKS=(
@@ -91,8 +116,7 @@ CHECKS=(
   "fonts-cjk    | have_pkg fonts-noto-cjk                     | apt: fonts-noto-cjk (ChatGPT UI in CJK locales)"
   "turbovnc     | [[ -x \"\$VNCSERVER\" ]]                      | apt: turbovnc (packagecloud.io/dcommander/turbovnc)"
   "chrome       | [[ -x \"\$CHROME_BIN\" ]]                     | google-chrome-stable .deb from dl.google.com"
-  "uv           | have_cmd uv                                 | astral.sh/uv/install.sh → ~/.local/bin/uv"
-  "playwright   | have_playwright                             | uv tool install playwright (CDP only, no browser download)"
+  "playwright   | have_playwright                             | uv is installed first when needed; uv tool install playwright (CDP only, no browser download)"
   "profile-dir  | [[ -d \"\$PROFILE\" ]]                        | mkdir; then sign in via 'chatgpt-setup --login'"
 )
 
@@ -130,7 +154,6 @@ run_checks() {
 SUDO=()
 need_sudo() {
   (( ${#SUDO[@]} )) && return 0
-  if [[ "$(id -u)" == 0 ]]; then SUDO=(env); return 0; fi
   have_cmd sudo || die "sudo is required to install system packages"
   if ! sudo -n true 2>/dev/null; then
     log "sudo needs a password — run 'sudo -v' in this terminal first (in Claude Code: '! sudo -v'), then re-run"
@@ -153,11 +176,15 @@ apt_install() {
 install_turbovnc() {
   need_sudo
   if [[ ! -f /etc/apt/sources.list.d/TurboVNC.list ]]; then
+    local tmp
+    tmp="$(mktemp)"
     log "adding the TurboVNC apt repository"
     curl -fsSL "$TURBOVNC_KEY_URL" | gpg --dearmor \
       | "${SUDO[@]}" tee /etc/apt/trusted.gpg.d/TurboVNC.gpg >/dev/null || die "TurboVNC key download failed"
-    "${SUDO[@]}" curl -fsSL -o /etc/apt/sources.list.d/TurboVNC.list "$TURBOVNC_LIST_URL" \
-      || die "TurboVNC.list download failed"
+    curl -fsSL -o "$tmp" "$TURBOVNC_LIST_URL" || { rm -f "$tmp"; die "TurboVNC.list download failed"; }
+    "${SUDO[@]}" install -m 644 "$tmp" /etc/apt/sources.list.d/TurboVNC.list \
+      || { rm -f "$tmp"; die "TurboVNC.list install failed"; }
+    rm -f "$tmp"
     APT_UPDATED=0
   fi
   apt_install turbovnc
@@ -166,11 +193,15 @@ install_turbovnc() {
 install_virtualgl() {
   need_sudo
   if [[ ! -f /etc/apt/sources.list.d/VirtualGL.list ]]; then
+    local tmp
+    tmp="$(mktemp)"
     log "adding the VirtualGL apt repository"
     curl -fsSL "$VIRTUALGL_KEY_URL" | gpg --dearmor \
       | "${SUDO[@]}" tee /etc/apt/trusted.gpg.d/VirtualGL.gpg >/dev/null || die "VirtualGL key download failed"
-    "${SUDO[@]}" curl -fsSL -o /etc/apt/sources.list.d/VirtualGL.list "$VIRTUALGL_LIST_URL" \
-      || die "VirtualGL.list download failed"
+    curl -fsSL -o "$tmp" "$VIRTUALGL_LIST_URL" || { rm -f "$tmp"; die "VirtualGL.list download failed"; }
+    "${SUDO[@]}" install -m 644 "$tmp" /etc/apt/sources.list.d/VirtualGL.list \
+      || { rm -f "$tmp"; die "VirtualGL.list install failed"; }
+    rm -f "$tmp"
     APT_UPDATED=0
   fi
   apt_install virtualgl
@@ -191,14 +222,14 @@ install_chrome() {
 install_uv() {
   log "installing uv into ~/.local/bin"
   curl -LsSf "$UV_INSTALL_URL" | sh || die "uv install failed"
-  export PATH="$HOME/.local/bin:$PATH"
-  have_cmd uv || die "uv is installed but not on PATH — add ~/.local/bin to PATH and re-run"
+  uv_bin >/dev/null || die "uv install did not create an executable at ~/.local/bin/uv"
 }
 
 install_playwright() {
-  have_cmd uv || install_uv
+  local uv
+  uv="$(uv_bin)" || { install_uv; uv="$(uv_bin)" || die "uv is unavailable after install"; }
   log "uv tool install playwright"
-  uv tool install playwright || die "uv tool install playwright failed"
+  "$uv" tool install playwright || die "uv tool install playwright failed"
 }
 
 install_platform() {
@@ -224,7 +255,6 @@ install_platform() {
       turbovnc)     install_turbovnc ;;
       chrome)       install_chrome ;;
       virtualgl)    install_virtualgl ;;
-      uv)           have_cmd uv || install_uv ;;
       playwright)   install_playwright ;;
       profile-dir)  mkdir -p "$PROFILE"; log "created $PROFILE (empty — sign in with 'chatgpt-setup --login')" ;;
     esac
@@ -236,7 +266,17 @@ install_platform() {
 # code path a real run takes is what gets exercised, then hand the user a noVNC URL + OTP.
 # ---------------------------------------------------------------------------------------
 do_login() {
-  [[ -d "$PROFILE" ]] || mkdir -p "$PROFILE"
+  local recorded_gpu wanted_gpu
+  recorded_gpu="$(sed -n -e 's/^CHROME_GPU=virtualgl$/virtualgl/p' \
+    -e 's/^CHROME_GPU=software$/software/p' "$STATE_DIR/stack.env" 2>/dev/null | head -1)"
+  wanted_gpu="$(chrome_gpu_mode)"
+  if curl -sf --max-time 3 "http://127.0.0.1:${CHATGPT_CDP_PORT:-9222}/json/version" \
+      | grep -Eq '"Browser"[[:space:]]*:[[:space:]]*"(Chrome|Chromium|HeadlessChrome|Edg|Comet)' \
+      && [[ "$recorded_gpu" != "$wanted_gpu" ]]; then
+    log "Chrome GPU mode changed (${recorded_gpu:-unrecorded} -> $wanted_gpu); restarting the profile Chrome"
+    pkill -f -- "user-data-dir=$PROFILE" 2>/dev/null || true
+    sleep 2
+  fi
   CHATGPT_STACK_ONLY=1 CHATGPT_LOCK_WAIT="${CHATGPT_LOCK_WAIT:-30}" "$BIN_DIR/chatgpt" \
     || die "stack bring-up failed (see messages above; logs under $STATE_DIR)"
   local display otp
@@ -284,6 +324,7 @@ case "$MODE" in
     fi
     ;;
   login)
+    mkdir -p "$PROFILE"
     run_checks
     (( ${#MISSING[@]} )) && die "missing: ${MISSING[*]} — run 'chatgpt-setup' first"
     do_login

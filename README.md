@@ -25,7 +25,7 @@ the one manual step, signing in:
 
 ```bash
 chatgpt-setup --check    # report what is present / missing; no sudo, no network
-chatgpt-setup            # install the missing pieces (apt via sudo, uv, Chrome .deb)
+chatgpt-setup            # install the missing pieces (apt via sudo, Chrome .deb; uv when needed)
 chatgpt-setup --login    # start VNC + Chrome + noVNC and print a URL + one-time password
 ```
 
@@ -58,13 +58,14 @@ chatgpt --effort pro --attach context.pdf --max-wait 7200 --out answer.md "quest
 
 - Linux, Bash ≥ 5, `flock`, `curl`, `ss`
 - `python3` with the `playwright` package — `uv tool install playwright` is
-  enough (the launcher finds that venv on its own when the system `python3`
+  enough (uv is only an installer, not a runtime dependency; the launcher finds
+  that venv, including uv's default `~/.local/bin` install, when system `python3`
   cannot import it; `CHATGPT_PYTHON` forces a specific interpreter). No
   `playwright install` — the tool attaches to Chrome over CDP.
 - `/usr/bin/google-chrome` (`CHATGPT_CHROME_BIN`), TurboVNC
   (`/opt/TurboVNC/bin/vncserver`, `CHATGPT_VNCSERVER`), `openbox`,
   `websockify`, noVNC assets under `/usr/share/novnc`
-- on a host with an NVIDIA GPU: VirtualGL (`/opt/VirtualGL/bin/vglrun`,
+- on a host with a working `nvidia-smi -L`: VirtualGL (`/opt/VirtualGL/bin/vglrun`,
   `CHATGPT_VGLRUN`; set it empty to opt out). Chrome then renders WebGL on the
   GPU through VirtualGL's EGL back end — no X server on the GPU needed. Without
   it Chrome falls back to software WebGL, which OpenAI's bot check treated as a
@@ -74,7 +75,8 @@ chatgpt --effort pro --attach context.pdf --max-wait 7200 --out answer.md "quest
 
 If a Chrome CDP stack is already alive on port 9222 it is reused. Otherwise a
 free VNC display is picked and Chrome CDP + noVNC are started automatically
-(on Linux under `vglrun -d egl` when VirtualGL is present, else with software
+(on Linux under `vglrun -d egl` when VirtualGL is present and `nvidia-smi -L`
+succeeds, else with software
 WebGL via `--enable-unsafe-swiftshader`; the startup line says which);
 stack state and logs live under `~/.chatgpt/`. The tool never modifies login
 or connector authentication state. `CHATGPT_STACK_ONLY=1 chatgpt` brings the
