@@ -20,7 +20,7 @@ import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Sequence, TextIO
+from typing import Callable, NamedTuple, Sequence, TextIO
 
 try:
     from playwright.sync_api import sync_playwright
@@ -28,7 +28,6 @@ except ImportError:  # Unit tests and --help do not require Playwright.
     sync_playwright = None
 
 
-REQUIRED_MODEL = "GPT-5.6 Sol"
 CHATGPT_URL = "https://chatgpt.com/"
 INPUT_SELECTORS = ["#prompt-textarea", 'div[contenteditable="true"]']
 FILE_INPUT_SELECTOR = 'input[type="file"]'
@@ -60,13 +59,21 @@ LOGIN_WALL_SELECTORS = [
     'button:has-text("로그인")',
     'button:has-text("Log in")',
 ]
-MODEL_SWITCHER_SELECTORS = [
-    'button.__composer-pill[aria-haspopup="menu"]',
-    'button[data-testid="model-switcher-dropdown-button"]',
-    'button[aria-label*="model" i]',
-]
-MENU_ITEM_SELECTOR = '[role="menuitem"], [role="menuitemradio"], [role="option"]'
-EFFORT_ITEM_SELECTORS = ['[role="menuitemradio"]', '[role="menuitem"]', '[role="option"]']
+# Composer model picker — Chat mode, measured live 2026-09-05 (DOM notes: .hippo/briefs/dom-facts.md on
+# dev). The pill opens a two-level menu: a model list (최신/Latest plus explicit versions) behind a toggle and a
+# five-tick effort slider. The pin is the label the CLOSED pill shows at max effort with the Latest
+# model — "6 Pro" is GPT-6 Pro today; below Pro, Latest is labelled by effort alone (an explicit
+# model keeps its version prefix, e.g. "5.6 High").
+REQUIRED_PRO_LABEL = "6 Pro"
+LATEST_MODEL_RE = re.compile(r"^(최신|latest|auto)$", re.I)
+EFFORT_LEVELS = ("instant", "medium", "high", "extra high", "pro")  # slider ticks 0..4
+PILL_SELECTOR = 'button.__composer-pill[aria-haspopup="menu"]'
+MODE_RADIO_SELECTOR = '[role="radio"][data-tpp-toggle-value]'
+CHAT_MODE_RADIO_SELECTOR = '[role="radio"][data-tpp-toggle-value="chatgpt"]'
+PICKER_SELECTOR = '[data-testid="composer-intelligence-picker-content"]'
+MODEL_TOGGLE_SELECTOR = f'{PICKER_SELECTOR} [role="menuitem"][aria-expanded]'
+MODEL_RADIO_SELECTOR = f'{PICKER_SELECTOR} [role="menuitemradio"]'
+EFFORT_TICK_SELECTOR = "[data-model-reasoning-effort-slider] span[data-selected]"
 QUOTA_HINTS = [
     "usage limit",
     "reached your limit",
@@ -80,8 +87,8 @@ QUOTA_HINTS = [
     "사용 한도",
     "요금제를 업그레이드",
 ]
-MODEL_RE = re.compile(r"GPT|gpt|o\d|Claude|Gemini")
 CONV_URL_RE = re.compile(r"/c/[0-9a-f]{8}[0-9a-f-]{4,}", re.I)
+CONVERSATION_ID_RE = re.compile(r"^[0-9a-f]{8}[0-9a-f-]{4,}$", re.I)
 STABLE_SECS = 4
 STATUS_INTERVAL = 15
 # Project grouping (ported from insane-review's pack_and_ask.py). The /g/g-p- URL mark and
@@ -114,6 +121,11 @@ class RateLimitedError(Exception):
     pass
 
 
+class Reply(NamedTuple):
+    body: str
+    conversation_url: str
+
+
 class UsageParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise UsageError(message)
@@ -127,7 +139,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = UsageParser(prog="chatgpt", description=__doc__)
     parser.add_argument("prompt", nargs="?", help="prompt text, or '-' to read stdin")
     parser.add_argument("-f", "--file", type=Path, help="read the prompt from a UTF-8 file")
-    parser.add_argument("--effort", default="pro", help="reasoning effort (default: pro)")
+    parser.add_argument(
+        "--effort",
+        default="pro",
+        help="reasoning effort: instant, medium, high, extra high, pro (default: pro)",
+    )
     parser.add_argument("--attach", type=Path, help="attach one file")
     parser.add_argument("--max-wait", type=int, default=7200, metavar="SEC")
     parser.add_argument("--out", type=Path, help="response path")
@@ -141,6 +157,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="start a plain chat instead of grouping under a project",
     )
+    parser.add_argument(
+        "--continue",
+        dest="conversation",
+        metavar="CONVERSATION",
+        help="follow up inside an existing conversation (its chatgpt.com URL or bare id); "
+        "the thread's context is retained and project grouping does not apply",
+    )
     return parser
 
 
@@ -150,12 +173,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         raise UsageError("provide exactly one prompt source: PROMPT, '-', or -f FILE")
     if args.max_wait <= 0:
         raise UsageError("--max-wait must be greater than zero")
-    if not args.effort.strip():
-        raise UsageError("--effort must not be empty")
+    args.effort = EFFORT_LEVELS[effort_index(args.effort)]
     if args.project is not None and args.no_project:
         raise UsageError("choose either --project or --no-project, not both")
     if args.project is not None and not args.project.strip():
         raise UsageError("--project must not be empty")
+    if args.conversation is not None:
+        if args.project is not None or args.no_project:
+            raise UsageError(
+                "--continue reopens an existing conversation; --project/--no-project do not apply"
+            )
+        args.conversation = conversation_url(args.conversation)
     return args
 
 
@@ -179,6 +207,30 @@ def response_path(given: Path | None) -> Path:
         return given.expanduser().resolve()
     stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
     return (Path.home() / ".chatgpt" / "out" / f"{stamp}.md").resolve()
+
+
+def conversation_url(text: str) -> str:
+    """Normalize --continue: a chatgpt.com conversation URL is kept as given (a project chat lives
+    under /g/g-p-…/c/<id>; ChatGPT resolves the bare /c/<id> form to it as well), a bare id
+    becomes https://chatgpt.com/c/<id>."""
+    value = text.strip().rstrip("/")
+    if CONVERSATION_ID_RE.match(value):
+        return f"{CHATGPT_URL}c/{value}"
+    if CONV_URL_RE.search(value):
+        return value if re.match(r"https?://", value, re.I) else f"https://{value}"
+    raise UsageError(
+        f"--continue expects a chatgpt.com conversation URL (…/c/<id>) or the bare id, got {text!r}"
+    )
+
+
+def conversation_trailer(url: str) -> str:
+    """Printed after every reply so the calling agent learns that it can follow up in-thread."""
+    return (
+        "---\n"
+        f"Conversation: {url}\n"
+        "To continue this thread with a follow-up (its context is retained), pass "
+        f"`--continue {url}` on the next `chatgpt` call. Omit it to start a fresh chat."
+    )
 
 
 def atomic_write(path: Path, text: str) -> None:
@@ -528,6 +580,44 @@ def enter_project(page, name: str) -> bool:
     return False
 
 
+# --- follow-ups in an existing conversation --------------------------------------------
+
+
+def conversation_key(url: str) -> str:
+    match = CONV_URL_RE.search(url)
+    return match.group(0) if match else ""
+
+
+def dialog_text(page) -> str:
+    try:
+        for surface in page.query_selector_all('[role="dialog"]'):
+            text = normalize(surface.inner_text())
+            if text:
+                return text[:160]
+    except Exception:
+        pass
+    return ""
+
+
+def open_conversation(page, url: str) -> str:
+    """Land on an existing conversation and return the URL the page settles on (ChatGPT rewrites
+    a bare /c/<id> to its project form). A deleted or foreign conversation bounces to the home
+    page behind an access dialog (measured 2026-09-05), so a page that never shows the id with
+    a composer is reported here, before anything is typed."""
+    key = conversation_key(url)
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    for _ in range(15):
+        time.sleep(1)
+        landed = current_url(page)
+        if key.casefold() in landed.casefold() and find_input(page) is not None:
+            return landed
+    dialog = dialog_text(page)
+    raise RuntimeError(
+        f"conversation {key} is not reachable; the page settled on {current_url(page)}"
+        + (f" ({dialog})" if dialog else "")
+    )
+
+
 # --- rate-limit modal ------------------------------------------------------------------
 
 
@@ -591,81 +681,85 @@ def ensure_page_target(port: int) -> None:
         pass
 
 
-def read_model_pills(page) -> list[str]:
-    values = []
-    for item in page.query_selector_all("button.__composer-pill"):
+# --- model picker ----------------------------------------------------------------------
+# Chat mode only: Work mode has its own six-tick picker whose top tier (Ultra) is a multi-turn
+# agentic mode, not the single long Pro answer this bridge exists for. Everything here fails
+# closed with ModelVerificationError (exit 2, nothing sent) the moment the UI disagrees.
+
+
+def effort_index(effort: str) -> int:
+    name = normalize(effort.replace("-", " ").replace("_", " ")).casefold()
+    if name not in EFFORT_LEVELS:
+        raise UsageError(f"--effort must be one of: {', '.join(EFFORT_LEVELS)} (got {effort!r})")
+    return EFFORT_LEVELS.index(name)
+
+
+def read_pill_label(page) -> str:
+    """The closed pill's text is the current selection ('6 Pro', 'High', …). While the menu is
+    open it shows a placeholder, so read it only with the menu closed."""
+    node = _q(page, [PILL_SELECTOR])
+    if node is None:
+        return ""
+    try:
+        return normalize(node.inner_text())
+    except Exception:
+        return ""
+
+
+def composer_mode(page) -> str:
+    """'chat' | 'work' | 'none' — 'none' when the page has no Chat/Work toggle at all."""
+    try:
+        radios = page.evaluate(
+            """() => [...document.querySelectorAll('[role="radio"][data-tpp-toggle-value]')]
+                .map(r => [r.getAttribute('data-tpp-toggle-value'), r.getAttribute('aria-checked') === 'true'])"""
+        )
+    except Exception:
+        radios = []
+    if not radios:
+        return "none"
+    return "chat" if any(value == "chatgpt" and checked for value, checked in radios) else "work"
+
+
+def ensure_chat_mode(page) -> None:
+    """Flip a Work-mode composer back to Chat. Chat and Work keep separate model settings, so
+    this never disturbs the Chat selection. A page without the toggle is left alone: the
+    picker checks that follow reject a Work-shaped menu anyway."""
+    mode = composer_mode(page)
+    if mode != "work":
+        return
+    log("composer is in Work mode; switching to Chat")
+    for radio in page.query_selector_all(CHAT_MODE_RADIO_SELECTOR):
         try:
-            value = normalize(item.inner_text())
-            if value:
-                values.append(value)
+            if not radio.is_visible():
+                continue
+            try:
+                radio.click(timeout=5000)
+            except Exception:
+                radio.dispatch_event("click")
+            break
         except Exception:
             continue
-    return values
+    for _ in range(10):
+        time.sleep(0.5)
+        if composer_mode(page) == "chat":
+            return
+    raise ModelVerificationError("composer is in Work mode and could not be switched to Chat")
 
 
-def open_switcher(page) -> bool:
-    for selector in MODEL_SWITCHER_SELECTORS:
+def open_picker(page) -> bool:
+    for item in page.query_selector_all(PILL_SELECTOR):
         try:
-            items = page.query_selector_all(selector)
-            for item in items:
-                if not item.is_visible():
-                    continue
-                try:
-                    item.click(timeout=5000)
-                except Exception:
-                    item.dispatch_event("click")
-                time.sleep(1.2)
-                return True
+            if not item.is_visible():
+                continue
+            try:
+                item.click(timeout=5000)
+            except Exception:
+                item.dispatch_event("click")
+            time.sleep(1.2)
+            return True
         except Exception:
             continue
     return False
-
-
-def model_name_from_text(text: str) -> str | None:
-    for line in text.splitlines():
-        value = normalize(line)
-        if value and MODEL_RE.search(value):
-            return value[:80]
-    return None
-
-
-def read_menu_state(page) -> dict:
-    state = {"model": None, "model_source": None, "models": [], "effort": None, "items": []}
-    try:
-        items = page.query_selector_all(MENU_ITEM_SELECTOR)
-    except Exception:
-        return state
-    for item in items:
-        try:
-            text = (item.inner_text() or "").strip()
-            role = item.get_attribute("role")
-            checked = item.get_attribute("aria-checked") == "true" or item.get_attribute("aria-selected") == "true"
-        except Exception:
-            continue
-        if text:
-            state["items"].append(text)
-        name = model_name_from_text(text)
-        if name:
-            if name not in state["models"]:
-                state["models"].append(name)
-            if checked and state["model"] is None:
-                state["model"] = name
-                state["model_source"] = "checked"
-            continue
-        if role == "menuitemradio" and checked and text:
-            state["effort"] = normalize(text)
-        if item.get_attribute("aria-haspopup") == "menu":
-            lines = [normalize(line) for line in text.splitlines() if normalize(line)]
-            if len(lines) >= 2:
-                state["effort"] = lines[-1]
-    if state["model"] is None and len(state["models"]) == 1:
-        state["model"] = state["models"][0]
-        state["model_source"] = "single"
-    return state
-
-
-def exact_model(model: str | None) -> bool:
-    return normalize(model).casefold() == REQUIRED_MODEL.casefold()
 
 
 def close_menu(page) -> None:
@@ -676,114 +770,168 @@ def close_menu(page) -> None:
     time.sleep(0.3)
 
 
-def collect_effort_items(page):
-    result = []
-    seen = set()
-    for selector in EFFORT_ITEM_SELECTORS:
-        try:
-            items = page.query_selector_all(selector)
-        except Exception:
-            continue
-        for item in items:
-            marker = id(item)
-            if marker not in seen:
-                result.append(item)
-                seen.add(marker)
-    return result
+PICKER_STATE_JS = """() => {
+  const picker = document.querySelector('[data-testid="composer-intelligence-picker-content"]');
+  if (!picker) return null;
+  const text = el => (el ? (el.innerText || '') : '').replace(/\\s+/g, ' ').trim();
+  const num = el => (el === null || el === undefined) ? null : Number(el);
+  const controls = picker.querySelector('[data-explicit-model]');
+  const toggle = picker.querySelector('[role="menuitem"][aria-expanded]');
+  const effort = toggle && toggle.querySelector('[data-max-effort]');
+  const slider = picker.querySelector('[data-model-reasoning-effort-slider] [role="slider"]');
+  const sliderItem = picker.querySelector('[role="menuitem"][aria-keyshortcuts]');
+  const view = picker.querySelector('[data-view]');
+  return {
+    view: view ? view.getAttribute('data-view') : null,
+    explicit_model: controls ? controls.getAttribute('data-explicit-model') : null,
+    label: text(toggle),
+    max_effort: effort ? effort.getAttribute('data-max-effort') === 'true' : null,
+    value_now: slider ? num(slider.getAttribute('aria-valuenow')) : null,
+    value_max: slider ? num(slider.getAttribute('aria-valuemax')) : null,
+    slider_disabled: sliderItem ? sliderItem.getAttribute('aria-disabled') === 'true' : null,
+    radios: [...picker.querySelectorAll('[role="menuitemradio"]')]
+      .map(r => [text(r), r.getAttribute('aria-checked') === 'true']),
+  };
+}"""
 
 
-def open_effort_submenu(page) -> bool:
+def read_picker_state(page) -> dict | None:
+    """One snapshot of the open picker, or None when no picker is on the page."""
     try:
-        triggers = page.query_selector_all('[role="menuitem"][aria-haspopup="menu"]')
+        return page.evaluate(PICKER_STATE_JS)
     except Exception:
-        return False
-    for trigger in triggers:
+        return None
+
+
+def choose_latest_model(page) -> None:
+    """Expand the model list and pick the Latest entry; confirm the picker no longer reports an
+    explicit model. The slider item is disabled while the list is expanded, so callers close and
+    reopen the menu before touching the slider."""
+    toggle = _q(page, [MODEL_TOGGLE_SELECTOR])
+    if toggle is None:
+        raise ModelVerificationError("model list toggle not found in the picker")
+    if toggle.get_attribute("aria-expanded") != "true":
         try:
-            text = trigger.inner_text() or ""
-            if MODEL_RE.search(text):
-                continue
-            trigger.dispatch_event("click")
-            time.sleep(1.2)
-            return True
+            toggle.click(timeout=5000)
         except Exception:
+            toggle.dispatch_event("click")
+        time.sleep(1.2)
+    radios = page.query_selector_all(MODEL_RADIO_SELECTOR)
+    seen = []
+    for radio in radios:
+        text = normalize(radio.inner_text())
+        seen.append(text)
+        if not LATEST_MODEL_RE.match(text):
             continue
-    return False
+        try:
+            radio.click(timeout=5000)
+        except Exception:
+            radio.dispatch_event("click")
+        time.sleep(1.3)
+        state = read_picker_state(page)
+        if state is None or state["explicit_model"] != "false":
+            raise ModelVerificationError(
+                f"clicked {text!r} but the picker still reports an explicit model "
+                f"({state and state['label']!r})"
+            )
+        return
+    raise ModelVerificationError(f"no Latest entry in the model list; the menu offers {seen!r}")
 
 
-def choose_effort(page, effort: str) -> bool:
-    wanted = normalize(effort).casefold()
-    candidates = collect_effort_items(page)
-    has_radio = any(
-        item.get_attribute("role") == "menuitemradio"
-        and not MODEL_RE.search(item.inner_text() or "")
-        for item in candidates
-    )
-    if not has_radio:
-        open_effort_submenu(page)
-        candidates = collect_effort_items(page)
-    for exact in (True, False):
-        for item in candidates:
-            try:
-                text = normalize(item.inner_text())
-                folded = text.casefold()
-                matches = folded == wanted if exact else wanted in folded
-                if not text or MODEL_RE.search(text) or not matches:
-                    continue
-                try:
-                    item.click(timeout=5000)
-                except Exception:
-                    item.dispatch_event("click")
-                time.sleep(1.5)
-                return True
-            except Exception:
-                continue
-    return False
+def choose_effort_tick(page, target: int) -> dict:
+    """Click the wanted tick (arrow keys and thumb drags do not move this slider) and confirm
+    aria-valuenow. Must run on a freshly opened menu."""
+    ticks = page.query_selector_all(EFFORT_TICK_SELECTOR)
+    if len(ticks) <= target:
+        raise ModelVerificationError(
+            f"effort slider has {len(ticks)} ticks; tick {target} ({EFFORT_LEVELS[target]}) is unavailable"
+        )
+    box = ticks[target].bounding_box()
+    if not box:
+        raise ModelVerificationError("effort slider tick has no geometry")
+    page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    time.sleep(1.3)
+    state = read_picker_state(page)
+    if state is None or state["value_now"] != target:
+        raise ModelVerificationError(
+            f"effort tick {target} ({EFFORT_LEVELS[target]}) did not take; "
+            f"slider reports {state and state['value_now']!r}"
+        )
+    return state
+
+
+def _reopen_picker(page) -> dict:
+    close_menu(page)
+    if not open_picker(page):
+        raise ModelVerificationError("model menu could not be reopened")
+    state = read_picker_state(page)
+    if state is None:
+        raise ModelVerificationError("model picker disappeared after reopening the menu")
+    return state
 
 
 def select_model(page, effort: str) -> str:
-    """Select effort and fail closed unless the menu says exactly GPT-5.6 Sol."""
+    """Land the composer on Chat mode · Latest model · the wanted effort tick, verified.
+
+    At Pro the closed pill must read exactly REQUIRED_PRO_LABEL. Below Pro the UI shows no
+    model version, so the check there is Latest + tick index."""
+    target = effort_index(effort)
+    wanted = EFFORT_LEVELS[target]
     try:
-        page.wait_for_selector("button.__composer-pill", timeout=20000)
+        page.wait_for_selector(PILL_SELECTOR, timeout=20000)
     except Exception:
         pass
-    wanted = normalize(effort)
-    pills = read_model_pills(page)
-    effort_ready = any(value.casefold() == wanted.casefold() for value in pills)
+    try:
+        return _select_model(page, target, wanted)
+    except ModelVerificationError:
+        close_menu(page)
+        raise
 
-    if not open_switcher(page):
+
+def _select_model(page, target: int, wanted: str) -> str:
+    ensure_chat_mode(page)
+
+    pill = read_pill_label(page)
+    if wanted == "pro" and pill == REQUIRED_PRO_LABEL:
+        log(f"model verified: pill already {REQUIRED_PRO_LABEL!r} (Latest · Pro)")
+        return f"Latest ({REQUIRED_PRO_LABEL})"
+
+    if not open_picker(page):
         raise ModelVerificationError("model menu could not be opened")
-    state = read_menu_state(page)
-    if not exact_model(state["model"]):
-        close_menu(page)
+    state = read_picker_state(page)
+    if state is None:
+        raise ModelVerificationError(f"model picker not found after opening the menu; pill read {pill!r}")
+    if state["value_max"] != len(EFFORT_LEVELS) - 1:
         raise ModelVerificationError(
-            f"required model {REQUIRED_MODEL!r}, menu reported {state['model']!r}"
+            f"unexpected effort slider (max tick {state['value_max']!r}, label {state['label']!r}); "
+            "is the composer in Work mode?"
         )
-
-    if effort_ready:
-        close_menu(page)
-        log(f"model verified: {REQUIRED_MODEL}; effort pill already {wanted}")
-        return f"{REQUIRED_MODEL} ({wanted})"
-
-    if not choose_effort(page, wanted):
-        close_menu(page)
-        raise ModelVerificationError(f"reasoning effort {wanted!r} could not be selected")
+    if state["explicit_model"] != "false":
+        log(f"explicit model selected ({state['label']!r}); switching to Latest")
+        choose_latest_model(page)
+        state = _reopen_picker(page)  # the slider only answers on an untouched menu
+    if state["value_now"] != target:
+        log(f"effort tick {state['value_now']} → {target} ({wanted})")
+        choose_effort_tick(page, target)
     close_menu(page)
 
-    pills = read_model_pills(page)
-    if not any(value.casefold() == wanted.casefold() for value in pills):
-        raise ModelVerificationError(
-            f"reasoning effort verification failed: expected {wanted!r}, pills={pills!r}"
-        )
-    if not open_switcher(page):
-        raise ModelVerificationError("model menu could not be reopened for final verification")
-    after = read_menu_state(page)
+    pill = read_pill_label(page)
+    if wanted == "pro":
+        if pill != REQUIRED_PRO_LABEL:
+            raise ModelVerificationError(f"required label {REQUIRED_PRO_LABEL!r}, pill reads {pill!r}")
+        log(f"model verified: {REQUIRED_PRO_LABEL} (Latest · Pro)")
+        return f"Latest ({REQUIRED_PRO_LABEL})"
+
+    after = _reopen_picker(page)
     close_menu(page)
-    if not exact_model(after["model"]):
+    if after["explicit_model"] != "false" or after["value_now"] != target:
         raise ModelVerificationError(
-            f"required model {REQUIRED_MODEL!r}, final menu reported {after['model']!r}"
+            f"final check failed: expected Latest at tick {target} ({wanted}), picker reported "
+            f"model={'Latest' if after['explicit_model'] == 'false' else after['label']!r} "
+            f"tick={after['value_now']!r}"
         )
-    log(f"model verified: {REQUIRED_MODEL}; effort selected: {wanted}")
-    return f"{REQUIRED_MODEL} ({wanted})"
+    log(f"model verified: Latest; effort {wanted} (tick {target}, pill {pill!r}); Latest shows no model version below Pro")
+    return f"Latest ({wanted})"
 
 
 def attach_file(page, path: Path) -> None:
@@ -880,17 +1028,25 @@ def release_submit_lock() -> None:
     log("submit lock released")
 
 
-def confirm_sent_and_capture(page, base_user: int) -> str:
+def confirm_sent_and_capture(page, base_user: int, bound_url: str | None = None) -> str:
+    """Wait for the send to register, then return the conversation URL. In a fresh chat the URL
+    flipping to /c/<id> is as good as a new user turn; when following up (bound_url) the page
+    already carries that URL, so only the new user turn counts."""
     deadline = time.monotonic() + 45
     sent = False
     while time.monotonic() < deadline:
-        url = current_url(page)
-        if count_nodes(page, USER_MSG_SELECTORS) > base_user or CONV_URL_RE.search(url):
+        if count_nodes(page, USER_MSG_SELECTORS) > base_user:
+            sent = True
+            break
+        if bound_url is None and CONV_URL_RE.search(current_url(page)):
             sent = True
             break
         time.sleep(1)
     if not sent:
         raise RuntimeError("no new user turn appeared after send")
+    if bound_url is not None:
+        log(f"conversation bound: {bound_url}")
+        return bound_url
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
         url = current_url(page)
@@ -1003,13 +1159,29 @@ def assistant_markdown(node) -> str:
             return ""
 
 
-def turn_complete(page, base_assistant: int) -> bool:
+# Climb from a message to its own turn container: the first ancestor that holds a copy action.
+# Should that ancestor hold other messages too, the copy action belongs to an earlier turn.
+TURN_HAS_COPY_JS = """el => {
+  const copy = %s;
+  let node = el;
+  for (let hop = 0; hop < 8 && node; hop++) {
+    if (node.querySelector(copy)) return node.querySelectorAll('[data-message-author-role]').length <= 1;
+    node = node.parentElement;
+  }
+  return false;
+}""" % json.dumps(", ".join(COPY_BTN_SELECTORS))
+
+
+def turn_complete(page, node) -> bool:
+    """The fresh assistant turn is done once nothing streams and its own turn carries the copy
+    action. A page-wide copy count would be satisfied too early: earlier turns keep their
+    buttons (a follow-up inherits all of them) and the user's own turn carries one as well."""
     if is_streaming(page):
         return False
-    return (
-        count_nodes(page, ASSISTANT_MSG_SELECTORS) > base_assistant
-        and count_nodes(page, COPY_BTN_SELECTORS) > 0
-    )
+    try:
+        return bool(node.evaluate(TURN_HAS_COPY_JS))
+    except Exception:
+        return False
 
 
 def wait_for_response(
@@ -1019,14 +1191,13 @@ def wait_for_response(
     base_assistant: int,
     deadline: float,
 ) -> str:
-    match = CONV_URL_RE.search(conversation_url)
-    conversation_key = match.group(0) if match else ""
+    key = conversation_key(conversation_url)
     stable_since = None
     previous = ""
     last_status = -STATUS_INTERVAL
     log(f"waiting for response (up to {max(0, int(deadline - time.monotonic()))}s)")
     while time.monotonic() < deadline:
-        if conversation_key not in current_url(page):
+        if key not in current_url(page):
             log("conversation drift detected; returning to the bound URL")
             page.goto(conversation_url, wait_until="domcontentloaded", timeout=60000)
             stable_since = None
@@ -1038,7 +1209,7 @@ def wait_for_response(
             log(f"response {status}; {remaining}s remaining")
             last_status = remaining // STATUS_INTERVAL
         node = fresh_assistant_node(page, base_ids, base_assistant)
-        if node is None or not turn_complete(page, base_assistant):
+        if node is None or not turn_complete(page, node):
             # The prompt is already in flight here: a throttle now blocks only the
             # harvest, so the error must carry the conversation URL for a later pickup.
             raise_if_rate_limited(
@@ -1075,7 +1246,8 @@ def ask(
     attach: Path | None,
     max_wait: int,
     project: str | None = None,
-) -> str:
+    conversation: str | None = None,
+) -> Reply:
     if sync_playwright is None:
         raise RuntimeError(
             "Python package 'playwright' is required "
@@ -1102,7 +1274,11 @@ def ask(
                 raise RuntimeError(f"ChatGPT session unavailable: {detail}")
             raise_if_rate_limited(page, "rate limited before submit; nothing sent")
 
-            if project:
+            bound_url = None
+            if conversation:
+                bound_url = open_conversation(page, conversation)
+                log(f"following up in conversation: {bound_url}")
+            elif project:
                 if enter_project(page, project):
                     log(f"chat grouped under project {project!r}: {current_url(page)}")
                 else:
@@ -1129,19 +1305,20 @@ def ask(
                     raise RuntimeError("prompt did not enter the composer intact")
             raise_if_rate_limited(page, "rate limited before submit; nothing sent")
             click_send(page)
-            conversation_url = confirm_sent_and_capture(page, base_user)
+            conversation_url = confirm_sent_and_capture(page, base_user, bound_url)
             release_submit_lock()
             deadline = time.monotonic() + max_wait
 
             for attempt in range(2):
                 try:
-                    return wait_for_response(
+                    body = wait_for_response(
                         page,
                         conversation_url,
                         base_ids,
                         base_assistant,
                         deadline,
                     )
+                    return Reply(body, conversation_url)
                 except (ResponseTimeoutError, RateLimitedError):
                     raise  # neither gets better by reloading the page right away
                 except Exception as exc:
@@ -1168,7 +1345,7 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     stdin: TextIO | None = None,
-    ask_fn: Callable[..., str] = ask,
+    ask_fn: Callable[..., Reply] = ask,
 ) -> int:
     try:
         args = parse_args(argv)
@@ -1176,21 +1353,24 @@ def main(
         if args.attach is not None and not args.attach.expanduser().is_file():
             raise UsageError(f"attachment is not a file: {args.attach}")
         output = response_path(args.out)
-        project = None if args.no_project else (args.project or default_project_name())
-        response = ask_fn(
+        project = None
+        if not args.no_project and args.conversation is None:
+            project = args.project or default_project_name()
+        reply = ask_fn(
             prompt,
             effort=args.effort,
             attach=args.attach,
             max_wait=args.max_wait,
             project=project,
-        ).strip()
-        if not response:
+            conversation=args.conversation,
+        )
+        body = reply.body.strip()
+        if not body:
             raise RuntimeError("harvested response is empty")
-        atomic_write(output, response + "\n")
-        if args.quiet:
-            print(output)
-        else:
-            print(response)
+        atomic_write(output, body + "\n")  # the saved file is the pure response
+        print(output if args.quiet else body)
+        print()
+        print(conversation_trailer(reply.conversation_url))
         return 0
     except UsageError as exc:
         print(f"chatgpt: {exc}", file=sys.stderr)
