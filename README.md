@@ -3,8 +3,12 @@
 A neutral Claude Code plugin that forwards a prompt to a logged-in subscription
 ChatGPT Pro browser session and returns the response as Markdown. No review
 framing, no templates, no repomix packing, no connector manipulation — just a
-bridge. The model is pinned and verified as `GPT-5.6 Sol` (fail-closed: nothing
-is sent on a mismatch), and the default reasoning effort is `Pro`.
+bridge. The composer is driven in **Chat** mode with the **Latest** model
+(`최신`) at **Pro** reasoning effort, and the run is fail-closed: the model pill
+must read exactly `6 Pro` (GPT-6 Pro, as of 2026-09) before anything is sent,
+otherwise the run stops with exit 2. A composer left in Work mode or on an
+explicit model is switched back first; Work mode's top tier (Ultra, a
+multi-turn agentic mode) is deliberately not used.
 
 Intended use: offloading ultra-hard analysis / design / research / verification
 tasks that take tens of minutes or more of Pro-tier reasoning.
@@ -33,8 +37,12 @@ chatgpt --effort pro --attach context.pdf --max-wait 7200 --out answer.md "quest
   under `~/.chatgpt/out/<timestamp>.md`.
 - Up to a few runs execute concurrently; excess waits on a lock for up to
   `CHATGPT_LOCK_WAIT` seconds (default 3600).
+- `--effort` takes one of the five slider positions `instant`, `medium`,
+  `high`, `extra high`, `pro` (default `pro`). Below `pro` the ChatGPT UI labels
+  the Latest model by effort alone (no version), so those runs are verified as
+  Latest + slider position only.
 - Exit codes: `0` success, `2` model verification failed (nothing sent),
-  `3` response timeout, `4` lock timeout.
+  `3` response timeout, `4` lock timeout, `5` ChatGPT rate limit.
 - Connectors (GitHub, Drive, …) already authenticated in the ChatGPT account
   are used by simply asking for them in the prompt (e.g. "use the GitHub
   connector to inspect repo X"); the tool never packs or attaches anything

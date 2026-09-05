@@ -28,7 +28,6 @@ except ImportError:  # Unit tests and --help do not require Playwright.
     sync_playwright = None
 
 
-REQUIRED_MODEL = "GPT-5.6 Sol"
 CHATGPT_URL = "https://chatgpt.com/"
 INPUT_SELECTORS = ["#prompt-textarea", 'div[contenteditable="true"]']
 FILE_INPUT_SELECTOR = 'input[type="file"]'
@@ -60,13 +59,21 @@ LOGIN_WALL_SELECTORS = [
     'button:has-text("로그인")',
     'button:has-text("Log in")',
 ]
-MODEL_SWITCHER_SELECTORS = [
-    'button.__composer-pill[aria-haspopup="menu"]',
-    'button[data-testid="model-switcher-dropdown-button"]',
-    'button[aria-label*="model" i]',
-]
-MENU_ITEM_SELECTOR = '[role="menuitem"], [role="menuitemradio"], [role="option"]'
-EFFORT_ITEM_SELECTORS = ['[role="menuitemradio"]', '[role="menuitem"]', '[role="option"]']
+# Composer model picker — Chat mode, measured live 2026-09-05 (DOM notes: .hippo/briefs/dom-facts.md on
+# dev). The pill opens a two-level menu: a model list (최신/Latest plus explicit versions) behind a toggle and a
+# five-tick effort slider. The pin is the label the CLOSED pill shows at max effort with the Latest
+# model — "6 Pro" is GPT-6 Pro today; below Pro, Latest is labelled by effort alone (an explicit
+# model keeps its version prefix, e.g. "5.6 High").
+REQUIRED_PRO_LABEL = "6 Pro"
+LATEST_MODEL_RE = re.compile(r"^(최신|latest|auto)$", re.I)
+EFFORT_LEVELS = ("instant", "medium", "high", "extra high", "pro")  # slider ticks 0..4
+PILL_SELECTOR = 'button.__composer-pill[aria-haspopup="menu"]'
+MODE_RADIO_SELECTOR = '[role="radio"][data-tpp-toggle-value]'
+CHAT_MODE_RADIO_SELECTOR = '[role="radio"][data-tpp-toggle-value="chatgpt"]'
+PICKER_SELECTOR = '[data-testid="composer-intelligence-picker-content"]'
+MODEL_TOGGLE_SELECTOR = f'{PICKER_SELECTOR} [role="menuitem"][aria-expanded]'
+MODEL_RADIO_SELECTOR = f'{PICKER_SELECTOR} [role="menuitemradio"]'
+EFFORT_TICK_SELECTOR = "[data-model-reasoning-effort-slider] span[data-selected]"
 QUOTA_HINTS = [
     "usage limit",
     "reached your limit",
@@ -80,7 +87,6 @@ QUOTA_HINTS = [
     "사용 한도",
     "요금제를 업그레이드",
 ]
-MODEL_RE = re.compile(r"GPT|gpt|o\d|Claude|Gemini")
 CONV_URL_RE = re.compile(r"/c/[0-9a-f]{8}[0-9a-f-]{4,}", re.I)
 STABLE_SECS = 4
 STATUS_INTERVAL = 15
@@ -127,7 +133,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = UsageParser(prog="chatgpt", description=__doc__)
     parser.add_argument("prompt", nargs="?", help="prompt text, or '-' to read stdin")
     parser.add_argument("-f", "--file", type=Path, help="read the prompt from a UTF-8 file")
-    parser.add_argument("--effort", default="pro", help="reasoning effort (default: pro)")
+    parser.add_argument(
+        "--effort",
+        default="pro",
+        help="reasoning effort: instant, medium, high, extra high, pro (default: pro)",
+    )
     parser.add_argument("--attach", type=Path, help="attach one file")
     parser.add_argument("--max-wait", type=int, default=7200, metavar="SEC")
     parser.add_argument("--out", type=Path, help="response path")
@@ -150,8 +160,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         raise UsageError("provide exactly one prompt source: PROMPT, '-', or -f FILE")
     if args.max_wait <= 0:
         raise UsageError("--max-wait must be greater than zero")
-    if not args.effort.strip():
-        raise UsageError("--effort must not be empty")
+    args.effort = EFFORT_LEVELS[effort_index(args.effort)]
     if args.project is not None and args.no_project:
         raise UsageError("choose either --project or --no-project, not both")
     if args.project is not None and not args.project.strip():
@@ -591,81 +600,85 @@ def ensure_page_target(port: int) -> None:
         pass
 
 
-def read_model_pills(page) -> list[str]:
-    values = []
-    for item in page.query_selector_all("button.__composer-pill"):
+# --- model picker ----------------------------------------------------------------------
+# Chat mode only: Work mode has its own six-tick picker whose top tier (Ultra) is a multi-turn
+# agentic mode, not the single long Pro answer this bridge exists for. Everything here fails
+# closed with ModelVerificationError (exit 2, nothing sent) the moment the UI disagrees.
+
+
+def effort_index(effort: str) -> int:
+    name = normalize(effort.replace("-", " ").replace("_", " ")).casefold()
+    if name not in EFFORT_LEVELS:
+        raise UsageError(f"--effort must be one of: {', '.join(EFFORT_LEVELS)} (got {effort!r})")
+    return EFFORT_LEVELS.index(name)
+
+
+def read_pill_label(page) -> str:
+    """The closed pill's text is the current selection ('6 Pro', 'High', …). While the menu is
+    open it shows a placeholder, so read it only with the menu closed."""
+    node = _q(page, [PILL_SELECTOR])
+    if node is None:
+        return ""
+    try:
+        return normalize(node.inner_text())
+    except Exception:
+        return ""
+
+
+def composer_mode(page) -> str:
+    """'chat' | 'work' | 'none' — 'none' when the page has no Chat/Work toggle at all."""
+    try:
+        radios = page.evaluate(
+            """() => [...document.querySelectorAll('[role="radio"][data-tpp-toggle-value]')]
+                .map(r => [r.getAttribute('data-tpp-toggle-value'), r.getAttribute('aria-checked') === 'true'])"""
+        )
+    except Exception:
+        radios = []
+    if not radios:
+        return "none"
+    return "chat" if any(value == "chatgpt" and checked for value, checked in radios) else "work"
+
+
+def ensure_chat_mode(page) -> None:
+    """Flip a Work-mode composer back to Chat. Chat and Work keep separate model settings, so
+    this never disturbs the Chat selection. A page without the toggle is left alone: the
+    picker checks that follow reject a Work-shaped menu anyway."""
+    mode = composer_mode(page)
+    if mode != "work":
+        return
+    log("composer is in Work mode; switching to Chat")
+    for radio in page.query_selector_all(CHAT_MODE_RADIO_SELECTOR):
         try:
-            value = normalize(item.inner_text())
-            if value:
-                values.append(value)
+            if not radio.is_visible():
+                continue
+            try:
+                radio.click(timeout=5000)
+            except Exception:
+                radio.dispatch_event("click")
+            break
         except Exception:
             continue
-    return values
+    for _ in range(10):
+        time.sleep(0.5)
+        if composer_mode(page) == "chat":
+            return
+    raise ModelVerificationError("composer is in Work mode and could not be switched to Chat")
 
 
-def open_switcher(page) -> bool:
-    for selector in MODEL_SWITCHER_SELECTORS:
+def open_picker(page) -> bool:
+    for item in page.query_selector_all(PILL_SELECTOR):
         try:
-            items = page.query_selector_all(selector)
-            for item in items:
-                if not item.is_visible():
-                    continue
-                try:
-                    item.click(timeout=5000)
-                except Exception:
-                    item.dispatch_event("click")
-                time.sleep(1.2)
-                return True
+            if not item.is_visible():
+                continue
+            try:
+                item.click(timeout=5000)
+            except Exception:
+                item.dispatch_event("click")
+            time.sleep(1.2)
+            return True
         except Exception:
             continue
     return False
-
-
-def model_name_from_text(text: str) -> str | None:
-    for line in text.splitlines():
-        value = normalize(line)
-        if value and MODEL_RE.search(value):
-            return value[:80]
-    return None
-
-
-def read_menu_state(page) -> dict:
-    state = {"model": None, "model_source": None, "models": [], "effort": None, "items": []}
-    try:
-        items = page.query_selector_all(MENU_ITEM_SELECTOR)
-    except Exception:
-        return state
-    for item in items:
-        try:
-            text = (item.inner_text() or "").strip()
-            role = item.get_attribute("role")
-            checked = item.get_attribute("aria-checked") == "true" or item.get_attribute("aria-selected") == "true"
-        except Exception:
-            continue
-        if text:
-            state["items"].append(text)
-        name = model_name_from_text(text)
-        if name:
-            if name not in state["models"]:
-                state["models"].append(name)
-            if checked and state["model"] is None:
-                state["model"] = name
-                state["model_source"] = "checked"
-            continue
-        if role == "menuitemradio" and checked and text:
-            state["effort"] = normalize(text)
-        if item.get_attribute("aria-haspopup") == "menu":
-            lines = [normalize(line) for line in text.splitlines() if normalize(line)]
-            if len(lines) >= 2:
-                state["effort"] = lines[-1]
-    if state["model"] is None and len(state["models"]) == 1:
-        state["model"] = state["models"][0]
-        state["model_source"] = "single"
-    return state
-
-
-def exact_model(model: str | None) -> bool:
-    return normalize(model).casefold() == REQUIRED_MODEL.casefold()
 
 
 def close_menu(page) -> None:
@@ -676,114 +689,168 @@ def close_menu(page) -> None:
     time.sleep(0.3)
 
 
-def collect_effort_items(page):
-    result = []
-    seen = set()
-    for selector in EFFORT_ITEM_SELECTORS:
-        try:
-            items = page.query_selector_all(selector)
-        except Exception:
-            continue
-        for item in items:
-            marker = id(item)
-            if marker not in seen:
-                result.append(item)
-                seen.add(marker)
-    return result
+PICKER_STATE_JS = """() => {
+  const picker = document.querySelector('[data-testid="composer-intelligence-picker-content"]');
+  if (!picker) return null;
+  const text = el => (el ? (el.innerText || '') : '').replace(/\\s+/g, ' ').trim();
+  const num = el => (el === null || el === undefined) ? null : Number(el);
+  const controls = picker.querySelector('[data-explicit-model]');
+  const toggle = picker.querySelector('[role="menuitem"][aria-expanded]');
+  const effort = toggle && toggle.querySelector('[data-max-effort]');
+  const slider = picker.querySelector('[data-model-reasoning-effort-slider] [role="slider"]');
+  const sliderItem = picker.querySelector('[role="menuitem"][aria-keyshortcuts]');
+  const view = picker.querySelector('[data-view]');
+  return {
+    view: view ? view.getAttribute('data-view') : null,
+    explicit_model: controls ? controls.getAttribute('data-explicit-model') : null,
+    label: text(toggle),
+    max_effort: effort ? effort.getAttribute('data-max-effort') === 'true' : null,
+    value_now: slider ? num(slider.getAttribute('aria-valuenow')) : null,
+    value_max: slider ? num(slider.getAttribute('aria-valuemax')) : null,
+    slider_disabled: sliderItem ? sliderItem.getAttribute('aria-disabled') === 'true' : null,
+    radios: [...picker.querySelectorAll('[role="menuitemradio"]')]
+      .map(r => [text(r), r.getAttribute('aria-checked') === 'true']),
+  };
+}"""
 
 
-def open_effort_submenu(page) -> bool:
+def read_picker_state(page) -> dict | None:
+    """One snapshot of the open picker, or None when no picker is on the page."""
     try:
-        triggers = page.query_selector_all('[role="menuitem"][aria-haspopup="menu"]')
+        return page.evaluate(PICKER_STATE_JS)
     except Exception:
-        return False
-    for trigger in triggers:
+        return None
+
+
+def choose_latest_model(page) -> None:
+    """Expand the model list and pick the Latest entry; confirm the picker no longer reports an
+    explicit model. The slider item is disabled while the list is expanded, so callers close and
+    reopen the menu before touching the slider."""
+    toggle = _q(page, [MODEL_TOGGLE_SELECTOR])
+    if toggle is None:
+        raise ModelVerificationError("model list toggle not found in the picker")
+    if toggle.get_attribute("aria-expanded") != "true":
         try:
-            text = trigger.inner_text() or ""
-            if MODEL_RE.search(text):
-                continue
-            trigger.dispatch_event("click")
-            time.sleep(1.2)
-            return True
+            toggle.click(timeout=5000)
         except Exception:
+            toggle.dispatch_event("click")
+        time.sleep(1.2)
+    radios = page.query_selector_all(MODEL_RADIO_SELECTOR)
+    seen = []
+    for radio in radios:
+        text = normalize(radio.inner_text())
+        seen.append(text)
+        if not LATEST_MODEL_RE.match(text):
             continue
-    return False
+        try:
+            radio.click(timeout=5000)
+        except Exception:
+            radio.dispatch_event("click")
+        time.sleep(1.3)
+        state = read_picker_state(page)
+        if state is None or state["explicit_model"] != "false":
+            raise ModelVerificationError(
+                f"clicked {text!r} but the picker still reports an explicit model "
+                f"({state and state['label']!r})"
+            )
+        return
+    raise ModelVerificationError(f"no Latest entry in the model list; the menu offers {seen!r}")
 
 
-def choose_effort(page, effort: str) -> bool:
-    wanted = normalize(effort).casefold()
-    candidates = collect_effort_items(page)
-    has_radio = any(
-        item.get_attribute("role") == "menuitemradio"
-        and not MODEL_RE.search(item.inner_text() or "")
-        for item in candidates
-    )
-    if not has_radio:
-        open_effort_submenu(page)
-        candidates = collect_effort_items(page)
-    for exact in (True, False):
-        for item in candidates:
-            try:
-                text = normalize(item.inner_text())
-                folded = text.casefold()
-                matches = folded == wanted if exact else wanted in folded
-                if not text or MODEL_RE.search(text) or not matches:
-                    continue
-                try:
-                    item.click(timeout=5000)
-                except Exception:
-                    item.dispatch_event("click")
-                time.sleep(1.5)
-                return True
-            except Exception:
-                continue
-    return False
+def choose_effort_tick(page, target: int) -> dict:
+    """Click the wanted tick (arrow keys and thumb drags do not move this slider) and confirm
+    aria-valuenow. Must run on a freshly opened menu."""
+    ticks = page.query_selector_all(EFFORT_TICK_SELECTOR)
+    if len(ticks) <= target:
+        raise ModelVerificationError(
+            f"effort slider has {len(ticks)} ticks; tick {target} ({EFFORT_LEVELS[target]}) is unavailable"
+        )
+    box = ticks[target].bounding_box()
+    if not box:
+        raise ModelVerificationError("effort slider tick has no geometry")
+    page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    time.sleep(1.3)
+    state = read_picker_state(page)
+    if state is None or state["value_now"] != target:
+        raise ModelVerificationError(
+            f"effort tick {target} ({EFFORT_LEVELS[target]}) did not take; "
+            f"slider reports {state and state['value_now']!r}"
+        )
+    return state
+
+
+def _reopen_picker(page) -> dict:
+    close_menu(page)
+    if not open_picker(page):
+        raise ModelVerificationError("model menu could not be reopened")
+    state = read_picker_state(page)
+    if state is None:
+        raise ModelVerificationError("model picker disappeared after reopening the menu")
+    return state
 
 
 def select_model(page, effort: str) -> str:
-    """Select effort and fail closed unless the menu says exactly GPT-5.6 Sol."""
+    """Land the composer on Chat mode · Latest model · the wanted effort tick, verified.
+
+    At Pro the closed pill must read exactly REQUIRED_PRO_LABEL. Below Pro the UI shows no
+    model version, so the check there is Latest + tick index."""
+    target = effort_index(effort)
+    wanted = EFFORT_LEVELS[target]
     try:
-        page.wait_for_selector("button.__composer-pill", timeout=20000)
+        page.wait_for_selector(PILL_SELECTOR, timeout=20000)
     except Exception:
         pass
-    wanted = normalize(effort)
-    pills = read_model_pills(page)
-    effort_ready = any(value.casefold() == wanted.casefold() for value in pills)
+    try:
+        return _select_model(page, target, wanted)
+    except ModelVerificationError:
+        close_menu(page)
+        raise
 
-    if not open_switcher(page):
+
+def _select_model(page, target: int, wanted: str) -> str:
+    ensure_chat_mode(page)
+
+    pill = read_pill_label(page)
+    if wanted == "pro" and pill == REQUIRED_PRO_LABEL:
+        log(f"model verified: pill already {REQUIRED_PRO_LABEL!r} (Latest · Pro)")
+        return f"Latest ({REQUIRED_PRO_LABEL})"
+
+    if not open_picker(page):
         raise ModelVerificationError("model menu could not be opened")
-    state = read_menu_state(page)
-    if not exact_model(state["model"]):
-        close_menu(page)
+    state = read_picker_state(page)
+    if state is None:
+        raise ModelVerificationError(f"model picker not found after opening the menu; pill read {pill!r}")
+    if state["value_max"] != len(EFFORT_LEVELS) - 1:
         raise ModelVerificationError(
-            f"required model {REQUIRED_MODEL!r}, menu reported {state['model']!r}"
+            f"unexpected effort slider (max tick {state['value_max']!r}, label {state['label']!r}); "
+            "is the composer in Work mode?"
         )
-
-    if effort_ready:
-        close_menu(page)
-        log(f"model verified: {REQUIRED_MODEL}; effort pill already {wanted}")
-        return f"{REQUIRED_MODEL} ({wanted})"
-
-    if not choose_effort(page, wanted):
-        close_menu(page)
-        raise ModelVerificationError(f"reasoning effort {wanted!r} could not be selected")
+    if state["explicit_model"] != "false":
+        log(f"explicit model selected ({state['label']!r}); switching to Latest")
+        choose_latest_model(page)
+        state = _reopen_picker(page)  # the slider only answers on an untouched menu
+    if state["value_now"] != target:
+        log(f"effort tick {state['value_now']} → {target} ({wanted})")
+        choose_effort_tick(page, target)
     close_menu(page)
 
-    pills = read_model_pills(page)
-    if not any(value.casefold() == wanted.casefold() for value in pills):
-        raise ModelVerificationError(
-            f"reasoning effort verification failed: expected {wanted!r}, pills={pills!r}"
-        )
-    if not open_switcher(page):
-        raise ModelVerificationError("model menu could not be reopened for final verification")
-    after = read_menu_state(page)
+    pill = read_pill_label(page)
+    if wanted == "pro":
+        if pill != REQUIRED_PRO_LABEL:
+            raise ModelVerificationError(f"required label {REQUIRED_PRO_LABEL!r}, pill reads {pill!r}")
+        log(f"model verified: {REQUIRED_PRO_LABEL} (Latest · Pro)")
+        return f"Latest ({REQUIRED_PRO_LABEL})"
+
+    after = _reopen_picker(page)
     close_menu(page)
-    if not exact_model(after["model"]):
+    if after["explicit_model"] != "false" or after["value_now"] != target:
         raise ModelVerificationError(
-            f"required model {REQUIRED_MODEL!r}, final menu reported {after['model']!r}"
+            f"final check failed: expected Latest at tick {target} ({wanted}), picker reported "
+            f"model={'Latest' if after['explicit_model'] == 'false' else after['label']!r} "
+            f"tick={after['value_now']!r}"
         )
-    log(f"model verified: {REQUIRED_MODEL}; effort selected: {wanted}")
-    return f"{REQUIRED_MODEL} ({wanted})"
+    log(f"model verified: Latest; effort {wanted} (tick {target}, pill {pill!r}); Latest shows no model version below Pro")
+    return f"Latest ({wanted})"
 
 
 def attach_file(page, path: Path) -> None:

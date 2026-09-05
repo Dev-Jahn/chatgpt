@@ -127,6 +127,210 @@ class ResponseCompletionTests(unittest.TestCase):
             self.assertFalse(ask_core.turn_complete(mock.Mock(), base_assistant=1))
 
 
+class EffortArgTests(unittest.TestCase):
+    def test_effort_names_normalize_to_slider_levels(self):
+        self.assertEqual(ask_core.parse_args(["--effort", "Extra-High", "hi"]).effort, "extra high")
+        self.assertEqual(ask_core.parse_args(["--effort", "PRO", "hi"]).effort, "pro")
+        self.assertEqual(ask_core.effort_index("extra_high"), 3)
+
+    def test_unknown_effort_is_a_usage_error(self):
+        for bad in ("ultra", "", "  ", "5"):
+            with self.assertRaises(ask_core.UsageError):
+                ask_core.parse_args(["--effort", bad, "hi"])
+
+
+class FakeNode:
+    TICK_X0 = 100
+    TICK_STEP = 50
+
+    def __init__(self, page, kind, index=0, text=""):
+        self.page, self.kind, self.index, self.text = page, kind, index, text
+
+    def inner_text(self):
+        if self.kind == "pill":
+            return "추론 수준" if self.page.menu_open else self.page.label().replace(" ", "\n")
+        return self.text
+
+    def get_attribute(self, name):
+        if self.kind == "toggle" and name == "aria-expanded":
+            return "true" if self.page.expanded else "false"
+        return None
+
+    def is_visible(self):
+        return True
+
+    def click(self, timeout=None):
+        self.page.act(self)
+
+    def dispatch_event(self, _name):
+        self.page.act(self)
+
+    def bounding_box(self):
+        return {"x": self.TICK_X0 + self.TICK_STEP * self.index, "y": 10, "width": 10, "height": 10}
+
+
+class FakePicker:
+    """Just enough of the 2026-09 Chat-mode composer to drive select_model: a Chat/Work toggle,
+    a pill whose closed text is the current selection, and a menu with a model list behind a
+    toggle plus a tick slider that ignores clicks while the list is expanded (measured)."""
+
+    LABELS = ["Instant", "중간", "High", "매우 높음", "Pro"]
+
+    def __init__(self, *, mode="chat", explicit=False, value=4, value_max=4, radios=None, picker=True):
+        self.mode = mode
+        self.explicit = explicit
+        self.value = value
+        self.value_max = value_max
+        self.radio_names = radios or ["최신", "GPT-5.6 Sol", "GPT-5.5"]
+        self.picker = picker
+        self.menu_open = False
+        self.expanded = False
+        self.menu_opens = 0
+        self.tick_clicks = []
+        self.mouse = mock.Mock()
+        self.mouse.click.side_effect = self._mouse_click
+        self.keyboard = mock.Mock()
+        self.keyboard.press.side_effect = self._press
+
+    def label(self):
+        if self.value == self.value_max:
+            return "5.6 Pro" if self.explicit else "6 Pro"
+        return self.LABELS[self.value]
+
+    def wait_for_selector(self, *_args, **_kwargs):
+        return None
+
+    def evaluate(self, js, *_args):
+        if "data-tpp-toggle-value" in js:
+            if self.mode is None:
+                return []
+            return [["chatgpt", self.mode == "chat"], ["work", self.mode == "work"]]
+        if "composer-intelligence-picker-content" in js:
+            if not (self.menu_open and self.picker):
+                return None
+            checked = "GPT-5.6 Sol" if self.explicit else "최신"
+            return {
+                "view": "advanced" if self.expanded else "simple",
+                "explicit_model": "true" if self.explicit else "false",
+                "label": self.label(),
+                "max_effort": self.value == self.value_max,
+                "value_now": self.value,
+                "value_max": self.value_max,
+                "slider_disabled": self.expanded,
+                "radios": [[name, name == checked] for name in self.radio_names],
+            }
+        raise AssertionError(f"unexpected evaluate: {js[:60]}")
+
+    def query_selector(self, selector):
+        nodes = self.query_selector_all(selector)
+        return nodes[0] if nodes else None
+
+    def query_selector_all(self, selector):
+        if selector == ask_core.PILL_SELECTOR:
+            return [FakeNode(self, "pill")]
+        if selector == ask_core.CHAT_MODE_RADIO_SELECTOR:
+            return [FakeNode(self, "chat")] if self.mode else []
+        if not self.menu_open:
+            return []
+        if selector == ask_core.MODEL_TOGGLE_SELECTOR:
+            return [FakeNode(self, "toggle")]
+        if selector == ask_core.MODEL_RADIO_SELECTOR:
+            return [FakeNode(self, "radio", i, name) for i, name in enumerate(self.radio_names)]
+        if selector == ask_core.EFFORT_TICK_SELECTOR:
+            return [FakeNode(self, "tick", i) for i in range(self.value_max + 1)]
+        return []
+
+    def _press(self, key):
+        if key == "Escape":
+            self.menu_open = False
+            self.expanded = False
+
+    def _mouse_click(self, x, _y):
+        index = int((x - FakeNode.TICK_X0) // FakeNode.TICK_STEP)
+        self.tick_clicks.append((index, self.expanded))
+        if self.menu_open and not self.expanded:
+            self.value = index
+
+    def act(self, node):
+        if node.kind == "pill":
+            self.menu_open = True
+            self.expanded = False
+            self.menu_opens += 1
+        elif node.kind == "chat":
+            self.mode = "chat"
+        elif node.kind == "toggle":
+            self.expanded = True
+        elif node.kind == "radio":
+            self.explicit = not ask_core.LATEST_MODEL_RE.match(node.text)
+            self.expanded = False
+
+
+class ModelPickerTests(unittest.TestCase):
+    def select(self, page, effort="pro"):
+        stderr = io.StringIO()
+        with mock.patch.object(ask_core.time, "sleep"), contextlib.redirect_stderr(stderr):
+            result = ask_core.select_model(page, effort)
+        return result, stderr.getvalue()
+
+    def test_pill_already_at_pro_skips_the_menu(self):
+        page = FakePicker()
+        result, log = self.select(page)
+        self.assertEqual(result, "Latest (6 Pro)")
+        self.assertEqual(page.menu_opens, 0)
+        self.assertIn("already", log)
+
+    def test_explicit_model_is_switched_to_latest_before_the_tick_moves(self):
+        page = FakePicker(explicit=True, value=2)
+        result, _ = self.select(page)
+        self.assertEqual(result, "Latest (6 Pro)")
+        self.assertFalse(page.explicit)
+        self.assertEqual(page.value, 4)
+        # exactly one tick click, on a reopened menu whose model list is collapsed
+        self.assertEqual(page.tick_clicks, [(4, False)])
+        self.assertFalse(page.menu_open)
+
+    def test_work_mode_is_flipped_to_chat_first(self):
+        page = FakePicker(mode="work", value=3)
+        result, log = self.select(page)
+        self.assertEqual(page.mode, "chat")
+        self.assertEqual(result, "Latest (6 Pro)")
+        self.assertIn("Work mode", log)
+
+    def test_lower_effort_verifies_latest_and_tick(self):
+        page = FakePicker()
+        result, _ = self.select(page, "high")
+        self.assertEqual(result, "Latest (high)")
+        self.assertEqual(page.value, 2)
+        self.assertFalse(page.menu_open)
+
+    def test_changed_pro_label_fails_closed(self):
+        page = FakePicker()
+        with mock.patch.object(ask_core, "REQUIRED_PRO_LABEL", "7 Pro"):
+            with self.assertRaises(ask_core.ModelVerificationError) as caught:
+                self.select(page)
+        self.assertIn("'6 Pro'", str(caught.exception))
+        self.assertFalse(page.menu_open)
+
+    def test_work_shaped_picker_is_refused(self):
+        page = FakePicker(mode=None, value=3, value_max=5)
+        with self.assertRaises(ask_core.ModelVerificationError) as caught:
+            self.select(page)
+        self.assertIn("Work mode", str(caught.exception))
+        self.assertEqual(page.tick_clicks, [])
+
+    def test_missing_picker_fails_closed(self):
+        page = FakePicker(value=3, picker=False)
+        with self.assertRaises(ask_core.ModelVerificationError):
+            self.select(page)
+
+    def test_menu_without_latest_entry_fails_closed(self):
+        page = FakePicker(explicit=True, radios=["GPT-5.6 Sol", "GPT-5.5"])
+        with self.assertRaises(ask_core.ModelVerificationError) as caught:
+            self.select(page)
+        self.assertIn("GPT-5.5", str(caught.exception))
+        self.assertEqual(page.tick_clicks, [])
+
+
 @contextlib.contextmanager
 def held_locks(paths):
     fds = []
