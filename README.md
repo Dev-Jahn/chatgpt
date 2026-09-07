@@ -44,19 +44,24 @@ chatgpt "your question"
 chatgpt -f prompt.md
 echo "your question" | chatgpt -
 chatgpt --effort pro --attach context.pdf --max-wait 7200 --out answer.md "question"
-chatgpt --continue https://chatgpt.com/c/<id> "follow-up question"
+chatgpt --continue "follow-up question"          # most recent thread from this folder
+chatgpt --resume 6a9b8621 "follow-up question"   # a specific thread, by its handle
 ```
 
 - stdout carries the response body, then a blank line and a short trailer
-  (`---`, `Conversation: <url>`, and one sentence on how to continue it);
+  (`---`, `Thread <handle> · <url>`, and one sentence on how to follow up);
   progress and diagnostics go to stderr. `--quiet` replaces the body with the
   saved-file path but keeps the trailer. The saved file (`--out`, default
   `~/.chatgpt/out/<timestamp>.md`) holds the body only.
-- `--continue <url-or-id>` reopens that conversation and appends the prompt
-  there, so the thread's context is retained — use it when the next request
-  builds on the previous answer. Project grouping does not apply to a
-  follow-up (`--project`/`--no-project` are rejected alongside it). A deleted
-  or foreign conversation is reported before anything is typed (exit 1).
+- Follow-ups keep the thread's context: `--continue` reopens the most recent
+  thread started from this folder; `--resume <handle>` picks one by the 8-hex
+  handle a previous trailer printed (a chatgpt.com conversation URL is accepted
+  too, for a chat this tool did not start). Threads are remembered in
+  `~/.chatgpt/threads.json` (`CHATGPT_STATE_DIR` relocates it); a handle that
+  is not in it — or matches more than one thread — is exit 64 with nothing
+  opened. Project grouping does not apply to a follow-up (`--project`/
+  `--no-project` are rejected alongside it). A deleted or foreign thread is
+  reported before anything is typed (exit 1).
 - Up to a few runs execute concurrently; excess waits on a lock for up to
   `CHATGPT_LOCK_WAIT` seconds (default 3600).
 - `--effort` takes one of the five slider positions `instant`, `medium`,

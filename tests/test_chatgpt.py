@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT / "bin"))
 import ask_core  # noqa: E402
 
 CONV = "https://chatgpt.com/g/g-p-6a9b861a83d48191ba6b3bd85b197802/c/6a9b8621-0250-83ee-93ed-50f50ee5d7bd"
-TRAILER = ask_core.conversation_trailer(CONV)
+TRAILER = ask_core.thread_trailer(CONV)
 
 
 def answer(*_args, **_kwargs):
@@ -334,56 +334,207 @@ class ModelPickerTests(unittest.TestCase):
         self.assertEqual(page.tick_clicks, [])
 
 
-class ContinueArgTests(unittest.TestCase):
+@contextlib.contextmanager
+def thread_state():
+    """A private ledger (CHATGPT_STATE_DIR) and a private cwd, so no test touches ~/.chatgpt."""
+    with tempfile.TemporaryDirectory() as directory:
+        state = Path(directory) / "state"
+        here = Path(directory) / "here"
+        here.mkdir()
+        old = os.getcwd()
+        os.chdir(here)
+        try:
+            with mock.patch.dict(os.environ, {"CHATGPT_STATE_DIR": str(state)}):
+                yield state / "threads.json"
+        finally:
+            os.chdir(old)
+
+
+def thread_entry(cid, cwd, last_used, started="2026-09-05T14:02:31+09:00", prompt="first question"):
+    return {
+        "id": cid,
+        "url": f"https://chatgpt.com/c/{cid}",
+        "cwd": cwd,
+        "started": started,
+        "last_used": last_used,
+        "prompt": prompt,
+    }
+
+
+def write_ledger(path, entries):
+    ask_core.atomic_write(path, json.dumps(entries))
+
+
+class FollowUpArgTests(unittest.TestCase):
+    def test_continue_is_a_flag_that_leaves_the_prompt_alone(self):
+        args = ask_core.parse_args(["--continue", "hello"])
+        self.assertEqual(args.prompt, "hello")
+        self.assertTrue(args.continue_last)
+        self.assertIsNone(args.resume)
+        plain = ask_core.parse_args(["hello"])
+        self.assertFalse(plain.continue_last)
+        self.assertIsNone(plain.resume)
+
+    def test_resume_takes_a_value(self):
+        args = ask_core.parse_args(["--resume", "6a9b8621", "hello"])
+        self.assertEqual(args.resume, "6a9b8621")
+        self.assertEqual(args.prompt, "hello")
+
+    def test_follow_up_flags_exclude_each_other_and_the_project_flags(self):
+        for argv in (
+            ["--continue", "--resume", "6a9b8621", "hi"],
+            ["--continue", "--project", "Docs", "hi"],
+            ["--continue", "--no-project", "hi"],
+            ["--resume", "6a9b8621", "--project", "Docs", "hi"],
+            ["--resume", "6a9b8621", "--no-project", "hi"],
+        ):
+            with self.assertRaises(ask_core.UsageError, msg=argv):
+                ask_core.parse_args(argv)
+
+
+class ThreadLedgerTests(unittest.TestCase):
     ID = "6a9b8621-0250-83ee-93ed-50f50ee5d7bd"
+    OTHER = "0c4b4501-1111-4222-8333-444455556666"
 
-    def test_conversation_forms_normalize_to_a_url(self):
-        self.assertEqual(ask_core.parse_args(["--continue", CONV, "hi"]).conversation, CONV)
-        self.assertEqual(
-            ask_core.parse_args(["--continue", self.ID, "hi"]).conversation,
-            f"https://chatgpt.com/c/{self.ID}",
-        )
-        self.assertEqual(
-            ask_core.parse_args(["--continue", f"chatgpt.com/c/{self.ID}/", "hi"]).conversation,
-            f"https://chatgpt.com/c/{self.ID}",
-        )
-        self.assertIsNone(ask_core.parse_args(["hi"]).conversation)
+    def resolve(self, *argv):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            url = ask_core.resolve_thread(ask_core.parse_args([*argv, "hi"]))
+        return url, stderr.getvalue()
 
-    def test_garbage_and_project_flags_are_usage_errors(self):
-        for bad in ("not-a-conversation", "https://chatgpt.com/", "", "  "):
-            with self.assertRaises(ask_core.UsageError):
-                ask_core.parse_args(["--continue", bad, "hi"])
-        with self.assertRaises(ask_core.UsageError):
-            ask_core.parse_args(["--continue", self.ID, "--project", "Docs", "hi"])
-        with self.assertRaises(ask_core.UsageError):
-            ask_core.parse_args(["--continue", self.ID, "--no-project", "hi"])
+    def test_new_thread_is_appended_and_a_follow_up_only_refreshes_last_used(self):
+        with thread_state() as ledger:
+            self.assertEqual(ask_core.record_thread(CONV, "  first\n question  "), "6a9b8621")
+            [first] = json.loads(ledger.read_text(encoding="utf-8"))
+            self.assertEqual(first["id"], self.ID)
+            self.assertEqual(first["url"], CONV)
+            self.assertEqual(first["cwd"], str(Path.cwd().resolve()))
+            self.assertEqual(first["prompt"], "first question")
+            self.assertEqual(first["started"], first["last_used"])
 
-    def test_main_passes_the_conversation_and_no_project(self):
+            first["started"] = first["last_used"] = "2020-01-01T00:00:00+00:00"
+            write_ledger(ledger, [first])
+            ask_core.record_thread(CONV, "a follow-up")
+            [again] = json.loads(ledger.read_text(encoding="utf-8"))
+            self.assertEqual(again["started"], "2020-01-01T00:00:00+00:00")
+            self.assertEqual(again["prompt"], "first question")
+            self.assertNotEqual(again["last_used"], "2020-01-01T00:00:00+00:00")
+
+            ask_core.record_thread(f"https://chatgpt.com/c/{self.OTHER}", "another topic")
+            self.assertEqual([e["id"] for e in json.loads(ledger.read_text(encoding="utf-8"))], [self.ID, self.OTHER])
+
+    def test_ledger_keeps_only_the_newest_entries(self):
+        with thread_state() as ledger, mock.patch.object(ask_core, "THREAD_LEDGER_CAP", 2):
+            for prefix in ("aaaaaaaa", "bbbbbbbb", "cccccccc"):
+                ask_core.record_thread(f"https://chatgpt.com/c/{prefix}-0000-4000-8000-000000000000", "q")
+            ids = [e["id"][:8] for e in json.loads(ledger.read_text(encoding="utf-8"))]
+            self.assertEqual(ids, ["bbbbbbbb", "cccccccc"])
+
+    def test_missing_corrupt_or_odd_ledger_reads_as_empty(self):
+        with thread_state() as ledger:
+            self.assertEqual(ask_core.load_threads(ledger), [])
+            ledger.parent.mkdir(parents=True)
+            for junk in ("{not json", '{"id": "an object, not a list"}', '[{"url": "no id"}, 3, "x"]'):
+                ledger.write_text(junk, encoding="utf-8")
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(ask_core.load_threads(ledger), [], junk)
+
+    def test_continue_picks_the_most_recent_thread_from_this_folder_only(self):
+        with thread_state() as ledger:
+            with self.assertRaises(ask_core.UsageError) as caught:
+                self.resolve("--continue")
+            self.assertIn("no thread has been started from this folder", str(caught.exception))
+            here = str(Path.cwd().resolve())
+            write_ledger(
+                ledger,
+                [
+                    thread_entry(self.ID, here, "2026-09-05T15:00:00+09:00", prompt="the one to continue"),
+                    thread_entry("11111111-2222-4333-8444-555555555555", here, "2026-09-05T14:00:00+09:00"),
+                    thread_entry(self.OTHER, "/somewhere/else", "2026-09-07T09:00:00+09:00"),
+                ],
+            )
+            url, stderr = self.resolve("--continue")
+            self.assertEqual(url, f"https://chatgpt.com/c/{self.ID}")
+            self.assertIn(
+                'continuing thread 6a9b8621 · started 2026-09-05 14:02 · "the one to continue"', stderr
+            )
+
+    def test_resume_matches_exactly_one_thread_by_prefix_from_any_folder(self):
+        with thread_state() as ledger:
+            write_ledger(
+                ledger,
+                [
+                    thread_entry(self.ID, "/somewhere/else", "2026-09-05T15:00:00+09:00"),
+                    thread_entry(self.OTHER, str(Path.cwd().resolve()), "2026-09-07T09:00:00+09:00"),
+                ],
+            )
+            for handle in ("6a9b8621", "6A9B8621", self.ID[:13], self.ID):
+                url, stderr = self.resolve("--resume", handle)
+                self.assertEqual(url, f"https://chatgpt.com/c/{self.ID}", handle)
+                self.assertIn("continuing thread 6a9b8621", stderr)
+
+    def test_resume_rejects_unknown_ambiguous_project_hash_and_garbage(self):
+        with thread_state() as ledger:
+            here = str(Path.cwd().resolve())
+            twin = "6a9b8621-ffff-4fff-8fff-ffffffffffff"
+            write_ledger(ledger, [thread_entry(self.ID, here, "1"), thread_entry(twin, here, "2")])
+            cases = {
+                "6a9b8621": "ambiguous",
+                "deadbeef": "previous reply",
+                ask_core.folder_hash(): "project hash",
+                "not-a-thread": "expects a thread handle",
+                "6a9b862": "expects a thread handle",  # seven characters is not a handle
+                "": "expects a thread handle",
+            }
+            for target, message in cases.items():
+                with self.assertRaises(ask_core.UsageError, msg=target) as caught:
+                    self.resolve("--resume", target)
+                self.assertIn(message, str(caught.exception), target)
+
+    def test_resume_by_url_needs_no_ledger(self):
+        with thread_state():
+            url, stderr = self.resolve("--resume", CONV)
+            self.assertEqual(url, CONV)
+            self.assertIn("resuming by URL", stderr)
+            url, _ = self.resolve("--resume", f"chatgpt.com/c/{self.ID}/")
+            self.assertEqual(url, f"https://chatgpt.com/c/{self.ID}")
+
+    def test_main_hands_the_resolved_thread_to_ask_fn_without_a_project(self):
         seen = {}
 
         def capture(_prompt, **kwargs):
             seen.update(kwargs)
             return ask_core.Reply("answer", CONV)
 
-        with contextlib.redirect_stdout(io.StringIO()), tempfile.TemporaryDirectory() as directory:
-            out = str(Path(directory) / "a.md")
-            code = ask_core.main(
-                ["--out", out, "--continue", self.ID, "hello"], stdin=io.StringIO(), ask_fn=capture
-            )
-        self.assertEqual(code, 0)
-        self.assertEqual(seen["conversation"], f"https://chatgpt.com/c/{self.ID}")
-        self.assertIsNone(seen["project"])
+        with thread_state() as ledger:
+            out = str(ledger.parent / "a.md")
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                code = ask_core.main(["--out", out, "--continue", "hello"], stdin=io.StringIO(), ask_fn=capture)
+                self.assertEqual(code, 64)
+                self.assertEqual(seen, {})
+                write_ledger(ledger, [thread_entry(self.ID, str(Path.cwd().resolve()), "1")])
+                code = ask_core.main(["--out", out, "--continue", "hello"], stdin=io.StringIO(), ask_fn=capture)
+                self.assertEqual(code, 0)
+                self.assertEqual(seen["conversation"], f"https://chatgpt.com/c/{self.ID}")
+                self.assertIsNone(seen["project"])
+                seen.clear()
+                code = ask_core.main(["--out", out, "--resume", "6a9b8621", "hello"], stdin=io.StringIO(), ask_fn=capture)
+                self.assertEqual(code, 0)
+                self.assertEqual(seen["conversation"], f"https://chatgpt.com/c/{self.ID}")
+            self.assertIn("no thread has been started from this folder", stderr.getvalue())
 
 
 class ContinuationFlowTests(unittest.TestCase):
-    def test_trailer_names_the_conversation_and_the_option(self):
+    def test_trailer_names_the_thread_and_both_options(self):
         self.assertEqual(
             TRAILER.splitlines(),
             [
                 "---",
-                f"Conversation: {CONV}",
-                "To continue this thread with a follow-up (its context is retained), pass "
-                f"`--continue {CONV}` on the next `chatgpt` call. Omit it to start a fresh chat.",
+                f"Thread 6a9b8621 · {CONV}",
+                "Follow-up on this topic? Add `--continue` to the next `chatgpt` call to keep going in this "
+                "thread (the most recent one from this folder), or `--resume 6a9b8621` to pick it explicitly. "
+                "Omit both to start a fresh chat.",
             ],
         )
 
