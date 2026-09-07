@@ -88,7 +88,9 @@ QUOTA_HINTS = [
     "요금제를 업그레이드",
 ]
 CONV_URL_RE = re.compile(r"/c/[0-9a-f]{8}[0-9a-f-]{4,}", re.I)
-CONVERSATION_ID_RE = re.compile(r"^[0-9a-f]{8}[0-9a-f-]{4,}$", re.I)
+# A thread handle is the first 8 characters of a conversation id; any longer prefix works too.
+THREAD_HANDLE_RE = re.compile(r"^[0-9a-f]{8}[0-9a-f-]*$", re.I)
+THREAD_LEDGER_CAP = 500
 STABLE_SECS = 4
 STATUS_INTERVAL = 15
 # Project grouping (ported from insane-review's pack_and_ask.py). The /g/g-p- URL mark and
@@ -159,10 +161,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--continue",
-        dest="conversation",
-        metavar="CONVERSATION",
-        help="follow up inside an existing conversation (its chatgpt.com URL or bare id); "
-        "the thread's context is retained and project grouping does not apply",
+        dest="continue_last",
+        action="store_true",
+        help="follow up in the most recent thread started from this folder "
+        "(its context is retained; project grouping does not apply)",
+    )
+    parser.add_argument(
+        "--resume",
+        metavar="THREAD",
+        help="follow up in a specific thread: the 8-hex handle a previous reply's trailer printed, "
+        "or a chatgpt.com conversation URL for a chat this tool did not start",
     )
     return parser
 
@@ -178,12 +186,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         raise UsageError("choose either --project or --no-project, not both")
     if args.project is not None and not args.project.strip():
         raise UsageError("--project must not be empty")
-    if args.conversation is not None:
-        if args.project is not None or args.no_project:
-            raise UsageError(
-                "--continue reopens an existing conversation; --project/--no-project do not apply"
-            )
-        args.conversation = conversation_url(args.conversation)
+    if args.continue_last and args.resume is not None:
+        raise UsageError("choose either --continue or --resume, not both")
+    if (args.continue_last or args.resume is not None) and (args.project is not None or args.no_project):
+        raise UsageError(
+            "--continue/--resume reopen an existing thread; --project/--no-project do not apply"
+        )
     return args
 
 
@@ -209,27 +217,154 @@ def response_path(given: Path | None) -> Path:
     return (Path.home() / ".chatgpt" / "out" / f"{stamp}.md").resolve()
 
 
-def conversation_url(text: str) -> str:
-    """Normalize --continue: a chatgpt.com conversation URL is kept as given (a project chat lives
-    under /g/g-p-…/c/<id>; ChatGPT resolves the bare /c/<id> form to it as well), a bare id
-    becomes https://chatgpt.com/c/<id>."""
-    value = text.strip().rstrip("/")
-    if CONVERSATION_ID_RE.match(value):
-        return f"{CHATGPT_URL}c/{value}"
-    if CONV_URL_RE.search(value):
-        return value if re.match(r"https?://", value, re.I) else f"https://{value}"
+# --- thread ledger ---------------------------------------------------------------------
+# Every thread this tool opens is remembered in <state dir>/threads.json, so a follow-up names
+# it by an 8-hex handle — or not at all: the most recent thread from this folder — instead of
+# the calling agent carrying a 100+ character URL across turns. Resolution runs before any
+# browser work: an unknown handle is a usage error with nothing opened.
+
+HANDLE_HINT = "a handle is the 8-hex `Thread` id printed at the end of a previous reply"
+
+
+def state_dir() -> Path:
+    return Path(os.environ.get("CHATGPT_STATE_DIR", str(Path.home() / ".chatgpt")))
+
+
+def thread_ledger_path() -> Path:
+    return state_dir() / "threads.json"
+
+
+def conversation_id(url: str) -> str:
+    """The id in a …/c/<id> conversation URL ('' when the URL carries none)."""
+    match = CONV_URL_RE.search(url)
+    return match.group(0)[len("/c/") :] if match else ""
+
+
+def thread_handle(conversation_id: str) -> str:
+    return conversation_id[:8].lower()
+
+
+def folder_hash() -> str:
+    return hashlib.sha256(str(Path.cwd().resolve()).encode("utf-8")).hexdigest()[:8]
+
+
+def prompt_excerpt(prompt: str, limit: int = 120) -> str:
+    text = " ".join(prompt.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def load_threads(path: Path) -> list[dict]:
+    """The ledger's entries, oldest first. A missing file is empty; a corrupt one is reported and
+    read as empty (the next successful send rewrites it)."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            raise ValueError("not a list")
+    except ValueError as exc:
+        log(f"thread ledger {path} is corrupt ({exc}); treating it as empty")
+        return []
+    return [
+        entry
+        for entry in data
+        if isinstance(entry, dict)
+        and isinstance(entry.get("id"), str)
+        and isinstance(entry.get("url"), str)
+    ]
+
+
+def record_thread(url: str, prompt: str, path: Path | None = None) -> str:
+    """Append a new thread, or refresh last_used on a known one; returns its handle. Called after
+    the conversation URL is bound and before the submit lock is released — that lock already
+    serialises concurrent runs, so the ledger needs no lock of its own."""
+    path = path or thread_ledger_path()
+    cid = conversation_id(url)
+    if not cid:
+        raise ValueError(f"no conversation id in {url!r}")
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    entries = load_threads(path)
+    for entry in entries:
+        if entry["id"].lower() == cid.lower():
+            entry["last_used"] = now
+            break
+    else:
+        entries.append(
+            {
+                "id": cid,
+                "url": url,
+                "cwd": str(Path.cwd().resolve()),
+                "started": now,
+                "last_used": now,
+                "prompt": prompt_excerpt(prompt),
+            }
+        )
+    atomic_write(path, json.dumps(entries[-THREAD_LEDGER_CAP:], ensure_ascii=False, indent=2) + "\n")
+    return thread_handle(cid)
+
+
+def latest_thread_here(entries: list[dict]) -> dict:
+    cwd = str(Path.cwd().resolve())
+    mine = [entry for entry in entries if entry.get("cwd") == cwd]
+    if not mine:
+        raise UsageError(
+            "no thread has been started from this folder yet; run without --continue to start one"
+        )
+    return max(mine, key=lambda entry: entry.get("last_used", ""))
+
+
+def thread_by_handle(handle: str, entries: list[dict]) -> dict:
+    needle = handle.lower()
+    hits = [entry for entry in entries if entry["id"].lower().startswith(needle)]
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        raise UsageError(
+            f"thread handle {handle!r} is ambiguous ({len(hits)} threads match); give more of the id"
+        )
+    if needle == folder_hash():
+        raise UsageError(f"{handle!r} is this folder's project hash, not a thread handle; {HANDLE_HINT}")
     raise UsageError(
-        f"--continue expects a chatgpt.com conversation URL (…/c/<id>) or the bare id, got {text!r}"
+        f"unknown thread {handle!r}; {HANDLE_HINT} "
+        "(pass the full conversation URL to resume a chat this tool did not start)"
     )
 
 
-def conversation_trailer(url: str) -> str:
+def resolve_thread(args: argparse.Namespace) -> str | None:
+    """The conversation URL a follow-up lands in (None for a fresh chat), decided from the ledger
+    before any browser work so a bad handle costs nothing but exit 64."""
+    if args.resume is not None:
+        value = args.resume.strip().rstrip("/")
+        if CONV_URL_RE.search(value):
+            log("resuming by URL (not in the thread ledger)")
+            return value if re.match(r"https?://", value, re.I) else f"https://{value}"
+        if not THREAD_HANDLE_RE.match(value):
+            raise UsageError(
+                "--resume expects a thread handle or a chatgpt.com conversation URL, "
+                f"got {args.resume!r}; {HANDLE_HINT}"
+            )
+        entry = thread_by_handle(value, load_threads(thread_ledger_path()))
+    elif args.continue_last:
+        entry = latest_thread_here(load_threads(thread_ledger_path()))
+    else:
+        return None
+    started = entry.get("started", "")[:16].replace("T", " ")
+    handle, excerpt = thread_handle(entry["id"]), entry.get("prompt", "")
+    log(f'continuing thread {handle} · started {started} · "{excerpt}"')
+    return entry["url"]
+
+
+def thread_trailer(url: str) -> str:
     """Printed after every reply so the calling agent learns that it can follow up in-thread."""
+    handle = thread_handle(conversation_id(url))
     return (
         "---\n"
-        f"Conversation: {url}\n"
-        "To continue this thread with a follow-up (its context is retained), pass "
-        f"`--continue {url}` on the next `chatgpt` call. Omit it to start a fresh chat."
+        f"Thread {handle} · {url}\n"
+        "Follow-up on this topic? Add `--continue` to the next `chatgpt` call to keep going in this "
+        f"thread (the most recent one from this folder), or `--resume {handle}` to pick it explicitly. "
+        "Omit both to start a fresh chat."
     )
 
 
@@ -408,12 +543,11 @@ def login_state(page, wait_secs: int = 15) -> str:
 def default_project_name() -> str:
     """'<folder> · <hash8>' — the path hash keeps two same-named folders (/a/api, /b/api)
     from merging into one remote project, since remote lookup matches display name only."""
-    digest = hashlib.sha256(str(Path.cwd().resolve()).encode("utf-8")).hexdigest()[:8]
-    return f"{Path.cwd().name} · {digest}"
+    return f"{Path.cwd().name} · {folder_hash()}"
 
 
 def project_cache_path() -> Path:
-    return Path(os.environ.get("CHATGPT_STATE_DIR", str(Path.home() / ".chatgpt"))) / "projects.json"
+    return state_dir() / "projects.json"
 
 
 def project_cache_key(name: str) -> str:
@@ -1045,13 +1179,11 @@ def confirm_sent_and_capture(page, base_user: int, bound_url: str | None = None)
     if not sent:
         raise RuntimeError("no new user turn appeared after send")
     if bound_url is not None:
-        log(f"conversation bound: {bound_url}")
         return bound_url
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
         url = current_url(page)
         if CONV_URL_RE.search(url):
-            log(f"conversation bound: {url}")
             return url
         time.sleep(1)
     raise SentUnknownLocationError("prompt was sent but the conversation URL was not captured")
@@ -1306,6 +1438,11 @@ def ask(
             raise_if_rate_limited(page, "rate limited before submit; nothing sent")
             click_send(page)
             conversation_url = confirm_sent_and_capture(page, base_user, bound_url)
+            log(f"thread bound: {thread_handle(conversation_id(conversation_url))} ({conversation_url})")
+            try:
+                record_thread(conversation_url, prompt)
+            except Exception as exc:  # bookkeeping — the reply, not the ledger, is the deliverable
+                log(f"thread ledger not updated: {exc}")
             release_submit_lock()
             deadline = time.monotonic() + max_wait
 
@@ -1353,8 +1490,9 @@ def main(
         if args.attach is not None and not args.attach.expanduser().is_file():
             raise UsageError(f"attachment is not a file: {args.attach}")
         output = response_path(args.out)
+        conversation = resolve_thread(args)
         project = None
-        if not args.no_project and args.conversation is None:
+        if not args.no_project and conversation is None:
             project = args.project or default_project_name()
         reply = ask_fn(
             prompt,
@@ -1362,7 +1500,7 @@ def main(
             attach=args.attach,
             max_wait=args.max_wait,
             project=project,
-            conversation=args.conversation,
+            conversation=conversation,
         )
         body = reply.body.strip()
         if not body:
@@ -1370,7 +1508,7 @@ def main(
         atomic_write(output, body + "\n")  # the saved file is the pure response
         print(output if args.quiet else body)
         print()
-        print(conversation_trailer(reply.conversation_url))
+        print(thread_trailer(reply.conversation_url))
         return 0
     except UsageError as exc:
         print(f"chatgpt: {exc}", file=sys.stderr)

@@ -9,7 +9,7 @@
     {
       "name": "chatgpt",
       "description": "Neutral command-line bridge to a logged-in ChatGPT Pro browser session.",
-      "version": "0.4.0",
+      "version": "0.4.1",
       "source": "./"
     }
   ]
