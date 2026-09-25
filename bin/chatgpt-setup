@@ -5,9 +5,12 @@
 #   chatgpt-setup            check every dependency, install the missing ones
 #   chatgpt-setup --check    report only; exit 1 if anything is missing (no sudo, no network)
 #   chatgpt-setup --login    bring up VNC + Chrome + noVNC and print the URL / one-time password
+#                            (on WSLg: open Chrome on the Windows desktop and sign in there)
 #
-# Automated platforms: Linux x86_64 with a Debian-family apt (Debian, Ubuntu, …). Other
-# platforms exit 2 with a pointer to the README's Environment section — add a branch to
+# Automated platforms: Linux x86_64 with a Debian-family apt (Debian, Ubuntu, …), including
+# WSL2. Under WSLg Chrome runs directly on the Windows desktop with GPU WebGL through Mesa's
+# D3D12 driver, so the VNC / noVNC / VirtualGL pieces are not needed there. Other platforms
+# exit 2 with a pointer to the README's Environment section — add a branch to
 # install_platform() when one is ported.
 set -uo pipefail
 
@@ -62,6 +65,14 @@ if ! is_debian_family; then
   log "install the items listed under 'Environment' in the README by hand"
   exit 2
 fi
+# Same detection as bin/chatgpt: a WSL kernel plus WSLg's X socket means a real desktop.
+WSLG_SOCKET="${CHATGPT_WSLG_SOCKET:-/mnt/wslg/.X11-unix/X0}"   # override exists for the test suite only
+if [[ "$(uname -r | tr '[:upper:]' '[:lower:]')" == *microsoft* && -S "$WSLG_SOCKET" ]]; then
+  PLATFORM=wslg
+else
+  PLATFORM=linux
+fi
+D3D12_DRI=/usr/lib/x86_64-linux-gnu/dri/d3d12_dri.so
 
 # ---------------------------------------------------------------------------------------
 # Checks — each returns 0 when satisfied. Package checks go through dpkg-query so a host
@@ -95,7 +106,9 @@ have_playwright() {
 }
 has_nvidia_gpu() { nvidia-smi -L >/dev/null 2>&1; }
 chrome_gpu_mode() {
-  if [[ -n "$VGLRUN" && -x "$VGLRUN" ]] && has_nvidia_gpu; then
+  if [[ "$PLATFORM" == "wslg" ]]; then
+    printf 'd3d12\n'
+  elif [[ -n "$VGLRUN" && -x "$VGLRUN" ]] && has_nvidia_gpu; then
     printf 'virtualgl\n'
   else
     printf 'software\n'
@@ -126,7 +139,20 @@ CHECKS=(
 # server on the GPU; /dev/nvidia* is world-accessible on stock driver installs, so
 # vglserver_config is not required.
 VGL_NOTE=""
-if [[ -z "$VGLRUN" ]]; then
+if [[ "$PLATFORM" == "wslg" ]]; then
+  # WSLg: Chrome runs on the Windows desktop, so the VNC stack is dead weight — and cannot
+  # start anyway (WSLg mounts /tmp/.X11-unix read-only). WebGL comes from Mesa's d3d12
+  # driver instead: without it Chrome under WSLg had no WebGL context at all.
+  VNC_ONLY=" openbox websockify novnc turbovnc "
+  KEPT=()
+  for row in "${CHECKS[@]}"; do
+    name="${row%%|*}"
+    [[ "$VNC_ONLY" == *" ${name// /} "* ]] || KEPT+=("$row")
+  done
+  CHECKS=("${KEPT[@]}"
+    "mesa-d3d12   | [[ -e \"\$D3D12_DRI\" ]]                     | apt: libgl1-mesa-dri (GPU WebGL for Chrome via D3D12)")
+  VGL_NOTE="virtualgl: skipped (WSLg — Chrome uses Mesa D3D12)"
+elif [[ -z "$VGLRUN" ]]; then
   VGL_NOTE="virtualgl: skipped (CHATGPT_VGLRUN is empty — software WebGL)"
 elif has_nvidia_gpu; then
   CHECKS+=("virtualgl    | [[ -x \"\$VGLRUN\" ]]                        | apt: virtualgl (packagecloud.io/dcommander/virtualgl) — GPU WebGL for Chrome")
@@ -247,6 +273,7 @@ install_platform() {
       websockify)   pkgs+=(websockify) ;;
       novnc)        pkgs+=(novnc) ;;
       fonts-cjk)    pkgs+=(fonts-noto-cjk) ;;
+      mesa-d3d12)   pkgs+=(libgl1-mesa-dri) ;;
     esac
   done
   (( ${#pkgs[@]} )) && apt_install "${pkgs[@]}"
@@ -263,12 +290,13 @@ install_platform() {
 
 # ---------------------------------------------------------------------------------------
 # Login helper: reuse bin/chatgpt's own stack bring-up (CHATGPT_STACK_ONLY=1) so the exact
-# code path a real run takes is what gets exercised, then hand the user a noVNC URL + OTP.
+# code path a real run takes is what gets exercised, then hand the user a noVNC URL + OTP
+# (on WSLg the Chrome window is already on the Windows desktop — nothing to tunnel).
 # ---------------------------------------------------------------------------------------
 do_login() {
   local recorded_gpu wanted_gpu
-  recorded_gpu="$(sed -n -e 's/^CHROME_GPU=virtualgl$/virtualgl/p' \
-    -e 's/^CHROME_GPU=software$/software/p' "$STATE_DIR/stack.env" 2>/dev/null | head -1)"
+  recorded_gpu="$(sed -nE 's/^CHROME_GPU=(virtualgl|software|d3d12)$/\1/p' \
+    "$STATE_DIR/stack.env" 2>/dev/null | head -1)"
   wanted_gpu="$(chrome_gpu_mode)"
   if curl -sf --max-time 3 "http://127.0.0.1:${CHATGPT_CDP_PORT:-9222}/json/version" \
       | grep -Eq '"Browser"[[:space:]]*:[[:space:]]*"(Chrome|Chromium|HeadlessChrome|Edg|Comet)' \
@@ -279,6 +307,16 @@ do_login() {
   fi
   CHATGPT_STACK_ONLY=1 CHATGPT_LOCK_WAIT="${CHATGPT_LOCK_WAIT:-30}" "$BIN_DIR/chatgpt" \
     || die "stack bring-up failed (see messages above; logs under $STATE_DIR)"
+  if [[ "$PLATFORM" == "wslg" ]]; then
+    cat <<EOF
+
+Chrome is open on the Windows desktop (WSLg). Sign in to chatgpt.com in that window,
+then run any 'chatgpt "…"' — the profile at
+  ${PROFILE}
+keeps the session.
+EOF
+    return 0
+  fi
   local display otp
   display="$(sed -n 's/^VNC_DISPLAY=\(:[0-9][0-9]*\)$/\1/p' "$STATE_DIR/stack.env" 2>/dev/null | head -1)"
   [[ -n "$display" ]] || die "no VNC_DISPLAY in $STATE_DIR/stack.env"

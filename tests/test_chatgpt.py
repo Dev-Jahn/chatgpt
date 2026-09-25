@@ -5,6 +5,7 @@ import fcntl
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1190,6 +1191,92 @@ class LinuxStackPathTests(unittest.TestCase):
             self.assertNotIn("without_locks", line, line)
 
 
+WSL_UNAME = "#!/bin/sh\ncase \"$1\" in -m) printf 'x86_64\\n' ;; -r) printf '6.18.33.1-microsoft-standard-WSL2\\n' ;; *) printf 'Linux\\n' ;; esac\n"
+
+
+def _fake_wslg_socket(directory: Path) -> str:
+    """A real Unix socket file standing in for WSLg's /mnt/wslg/.X11-unix/X0."""
+    path = directory / "X0"
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.bind(str(path))
+    return str(path)
+
+
+class WslgPathTests(unittest.TestCase):
+    """WSLg has a real desktop but mounts /tmp/.X11-unix read-only, so the VNC path cannot
+    start there (measured: `vncserver` died within ~2s). Chrome must run directly on WSLg's
+    :0 with Mesa's d3d12 driver — plain Chrome under WSLg had no WebGL at all."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.fake_bin = self.home / "bin"
+        self.mark = self.home / "mark"
+        stubs = _linux_stack_stubs(self.home)
+        _write_stubs(self.fake_bin, {
+            **stubs,
+            "uname": WSL_UNAME,
+            "chrome": stubs["chrome"] + (
+                f"printf 'DISPLAY=%s GALLIUM_DRIVER=%s ADAPTER=%s\\n' \"$DISPLAY\" \"$GALLIUM_DRIVER\" "
+                f"\"$MESA_D3D12_DEFAULT_ADAPTER_NAME\" > \"{self.mark}/chrome-env\"\n"
+            ),
+        })
+        self.overrides = {
+            "CHATGPT_VNCSERVER": str(self.fake_bin / "vncserver"),
+            "CHATGPT_CHROME_BIN": str(self.fake_bin / "chrome"),
+            "CHATGPT_VGLRUN": str(self.fake_bin / "vglrun"),
+            "CHATGPT_SUBMIT_GAP_MIN": "0",
+            "CHATGPT_SUBMIT_GAP_MAX": "0",
+        }
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_wslg(self, **updates):
+        env = {**self.overrides, "CHATGPT_WSLG_SOCKET": _fake_wslg_socket(self.home), **updates}
+        with mock.patch.dict(os.environ):
+            os.environ.pop("DISPLAY", None)
+            os.environ.pop("CHATGPT_D3D12_ADAPTER", None)
+            return _run_wrapper(self.home, self.fake_bin, **env)
+
+    def test_wslg_runs_chrome_on_the_desktop_with_d3d12_and_no_vnc(self):
+        result = self.run_wslg()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "linux answer\n")
+        self.assertIn("GPU via WSLg D3D12, adapter NVIDIA", result.stderr)
+        # First run: the profile is created and the user is pointed at the Windows desktop.
+        self.assertIn("Windows desktop", result.stderr)
+        self.assertTrue((self.home / ".chatgpt" / "browser-profile").is_dir())
+        chrome_env = (self.mark / "chrome-env").read_text(encoding="utf-8")
+        self.assertEqual(chrome_env, "DISPLAY=:0 GALLIUM_DRIVER=d3d12 ADAPTER=NVIDIA\n")
+        chrome_args = (self.mark / "chrome-args").read_text(encoding="utf-8")
+        self.assertNotIn("swiftshader", chrome_args)
+        self.assertEqual(list(self.mark.glob("vnc-args-*")), [])
+        self.assertFalse((self.mark / "port6080").exists(), "websockify must not run")
+        self.assertFalse((self.mark / "vglrun-args").exists(), "VirtualGL must not run")
+        self.assertNotIn("VNC", result.stderr)
+        state = (self.home / ".chatgpt" / "stack.env").read_text(encoding="utf-8")
+        self.assertRegex(state, r"(?m)^CHROME_GPU=d3d12$")
+        self.assertNotIn("VNC_DISPLAY", state)
+        self.assertNotIn("NOVNC_PORT", state)
+
+    def test_empty_adapter_override_lets_mesa_pick(self):
+        result = self.run_wslg(CHATGPT_D3D12_ADAPTER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        chrome_env = (self.mark / "chrome-env").read_text(encoding="utf-8")
+        self.assertEqual(chrome_env, "DISPLAY=:0 GALLIUM_DRIVER=d3d12 ADAPTER=\n")
+
+    def test_wsl_without_wslg_keeps_the_vnc_path(self):
+        (self.home / ".chatgpt" / "browser-profile").mkdir(parents=True)
+        result = self.run_wslg(CHATGPT_WSLG_SOCKET=str(self.home / "absent"), CHATGPT_VGLRUN="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("started VNC :", result.stderr)
+        self.assertIn("started noVNC 6080", result.stderr)
+        self.assertNotIn("D3D12", result.stderr)
+        chrome_env = (self.mark / "chrome-env").read_text(encoding="utf-8")
+        self.assertRegex(chrome_env, r"^DISPLAY=:\d+ GALLIUM_DRIVER= ADAPTER=\n$")
+
+
 class PythonResolutionTests(unittest.TestCase):
     """ask_core runs under the first interpreter that can import playwright: CHATGPT_PYTHON,
     then python3, then the venv `uv tool install playwright` creates. Uses the Darwin
@@ -1459,6 +1546,21 @@ class SetupScriptTests(unittest.TestCase):
             result = self.run_setup(home, fake_bin, "--check", CHATGPT_VGLRUN="", **common)
             self.assertNotIn("virtualgl ", result.stdout)
             self.assertIn("virtualgl: skipped (CHATGPT_VGLRUN is empty", result.stderr)
+
+    def test_check_on_wslg_drops_the_vnc_stack_and_virtualgl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            fake_bin = home / "bin"
+            _write_stubs(fake_bin, {**self.linux_stubs(""), "uname": WSL_UNAME, "python3": "#!/bin/sh\nexit 1\n"})
+            release = self.os_release(home, "ID=ubuntu\n")
+            result = self.run_setup(home, fake_bin, "--check", CHATGPT_OS_RELEASE=release,
+                                    CHATGPT_WSLG_SOCKET=_fake_wslg_socket(home),
+                                    CHATGPT_VNCSERVER=str(home / "absent"), CHATGPT_CHROME_BIN=str(home / "absent"),
+                                    CHATGPT_PROFILE=str(home / "absent"))
+            rows = [line.split()[0] for line in result.stdout.splitlines()[1:]]
+            self.assertEqual(rows, ["bash>=5", "flock", "curl", "ss", "gpg", "python3", "fonts-cjk", "chrome",
+                                    "playwright", "profile-dir", "mesa-d3d12"])
+            self.assertIn("virtualgl: skipped (WSLg", result.stderr)
 
     def test_check_lists_missing_items_and_exits_1(self):
         with tempfile.TemporaryDirectory() as directory:

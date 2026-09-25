@@ -23,9 +23,9 @@ claude plugin install chatgpt@jahns-cc-marketplace
 Once the plugin is installed, its `bin/` directory is automatically added to
 `PATH` in Claude Code sessions — just call `chatgpt`. No symlinks needed.
 
-On a fresh Linux x86_64 host with apt (Debian/Ubuntu), `chatgpt-setup` installs
-everything listed under [Environment](#environment) and then walks you through
-the one manual step, signing in:
+On a fresh Linux x86_64 host with apt (Debian/Ubuntu, WSL2 included),
+`chatgpt-setup` installs everything listed under [Environment](#environment) and
+then walks you through the one manual step, signing in:
 
 ```bash
 chatgpt-setup --check    # report what is present / missing; no sudo, no network
@@ -35,7 +35,9 @@ chatgpt-setup --login    # start VNC + Chrome + noVNC and print a URL + one-time
 
 `--login` prints an `ssh -L` tunnel line and a `http://localhost:6080/vnc.html?…`
 URL; sign in to chatgpt.com in that Chrome window once and the profile keeps the
-session. Other platforms exit 2 — install by hand from the list below.
+session. On WSLg there is no tunnel: `--login` opens Chrome on the Windows
+desktop — sign in there. Other platforms exit 2 — install by hand from the list
+below.
 
 ## Usage
 
@@ -94,8 +96,17 @@ chatgpt --resume 6a9b8621 "follow-up question"   # a specific thread, by its han
   was used.
 - a logged-in Chrome profile at `~/.chatgpt/browser-profile` (override with `CHATGPT_PROFILE`)
 
-If a Chrome CDP stack is already alive on port 9222 it is reused. Otherwise a
-free VNC display is picked and Chrome CDP + noVNC are started automatically
+On WSL2 with WSLg (a WSL kernel plus WSLg's `/mnt/wslg/.X11-unix/X0`) the VNC
+pieces, `openbox` and VirtualGL are not used: Chrome runs directly on the
+Windows desktop (`DISPLAY=:0`) like on macOS, with WebGL on the Windows GPU
+through Mesa's d3d12 driver (`GALLIUM_DRIVER=d3d12`, from `libgl1-mesa-dri`).
+When `nvidia-smi -L` succeeds the NVIDIA adapter is requested
+(`CHATGPT_D3D12_ADAPTER` overrides; set it empty to let Mesa pick). Plain
+Chrome under WSLg has no WebGL at all, and the VNC path cannot start there
+(WSLg mounts `/tmp/.X11-unix` read-only). WSL without WSLg uses the Linux path.
+
+If a Chrome CDP stack is already alive on port 9222 it is reused. Otherwise
+(headless Linux) a free VNC display is picked and Chrome CDP + noVNC are started automatically
 (on Linux under `vglrun -d egl` when VirtualGL is present and `nvidia-smi -L`
 succeeds, else with software
 WebGL via `--enable-unsafe-swiftshader`; the startup line says which);
