@@ -7,7 +7,8 @@ The plugin's `bin/` is on PATH — call `chatgpt` directly. If it fails on a
 missing dependency or a login page, `chatgpt-setup --check` shows what is
 missing, `chatgpt-setup` installs it (Linux x86_64 / Debian-family apt only),
 and `chatgpt-setup --login` starts the browser stack and prints a noVNC URL +
-one-time password for the user to sign in with.
+one-time password for the user to sign in with (on WSLg it opens Chrome on the
+Windows desktop instead — the user signs in there).
 
 ```bash
 chatgpt "your question"

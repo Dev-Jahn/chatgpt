@@ -49,6 +49,18 @@ if ((BASH_VERSINFO[0] < 5)); then
 fi
 
 OS_NAME="$(uname -s)"
+# Three platforms. darwin and wslg have a real desktop, so Chrome runs headful on it; linux
+# (headless) gets Xvnc + openbox + noVNC. WSLg must not take the VNC path: it mounts
+# /tmp/.X11-unix read-only, so Xvnc cannot create its socket and `vncserver` dies within ~2s
+# (measured on WSL2 / Ubuntu 26.04). WSL without WSLg has no such mount and stays on linux.
+WSLG_SOCKET="${CHATGPT_WSLG_SOCKET:-/mnt/wslg/.X11-unix/X0}"   # override exists for the test suite only
+if [[ "$OS_NAME" == "Darwin" ]]; then
+  PLATFORM=darwin
+elif [[ "$(uname -r | tr '[:upper:]' '[:lower:]')" == *microsoft* && -S "$WSLG_SOCKET" ]]; then
+  PLATFORM=wslg
+else
+  PLATFORM=linux
+fi
 
 STATE_DIR="$HOME/.chatgpt"
 STATE="$STATE_DIR/stack.env"
@@ -58,25 +70,35 @@ NOVNC_PORT="${CHATGPT_NOVNC_PORT:-6080}"
 LOCK_WAIT="${CHATGPT_LOCK_WAIT:-3600}"
 # Internal concurrency override; intentionally not part of the public interface.
 MAX_PARALLEL="${CHATGPT_MAX_PARALLEL:-3}"
-# CHATGPT_STACK_ONLY=1: bring up (or reuse) the VNC/Chrome/noVNC stack and exit 0 without
-# submitting anything. Used by `chatgpt-setup --login` so the user can sign in through noVNC.
+# CHATGPT_STACK_ONLY=1: bring up (or reuse) the browser stack and exit 0 without submitting
+# anything. Used by `chatgpt-setup --login` so the user can sign in (noVNC on headless Linux,
+# the Chrome window itself on macOS / WSLg).
 STACK_ONLY="${CHATGPT_STACK_ONLY:-0}"
 VNCSERVER="${CHATGPT_VNCSERVER:-/opt/TurboVNC/bin/vncserver}"
 # VirtualGL puts Chrome's WebGL on a real GPU (Linux). An explicitly empty CHATGPT_VGLRUN opts
 # out, hence `-` rather than `:-`.
 VGLRUN="${CHATGPT_VGLRUN-/opt/VirtualGL/bin/vglrun}"
-if [[ "$OS_NAME" == "Darwin" ]]; then
+if [[ "$PLATFORM" == "darwin" ]]; then
   CHROME_BIN="${CHATGPT_CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
 else
   CHROME_BIN="${CHATGPT_CHROME_BIN:-/usr/bin/google-chrome}"
 fi
 
+# How Chrome gets its WebGL, recorded in stack.env as CHROME_GPU. macOS needs no choice.
 chrome_gpu_mode() {
-  if [[ -n "$VGLRUN" && -x "$VGLRUN" ]] && nvidia-smi -L >/dev/null 2>&1; then
-    printf 'virtualgl\n'
-  else
-    printf 'software\n'
-  fi
+  case "$PLATFORM" in
+    wslg) printf 'd3d12\n' ;;
+    linux)
+      if [[ -n "$VGLRUN" && -x "$VGLRUN" ]] && nvidia-smi -L >/dev/null 2>&1; then
+        printf 'virtualgl\n'
+      else
+        printf 'software\n'
+      fi ;;
+  esac
+}
+
+recorded_chrome_gpu() {
+  sed -nE 's/^CHROME_GPU=(virtualgl|software|d3d12)$/\1/p' "$STATE" 2>/dev/null | head -1
 }
 
 mkdir -p "$STATE_DIR" "$STATE_DIR/out" "$STATE_DIR/slots"
@@ -198,7 +220,7 @@ spawn_unlocked() {
 }
 
 port_open() {
-  if [[ "$OS_NAME" == "Darwin" ]]; then
+  if [[ "$PLATFORM" == "darwin" ]]; then
     lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
   else
     ss -ltn 2>/dev/null | grep -q "127.0.0.1:$1 "
@@ -280,11 +302,13 @@ start_chrome() {
     return 1
   fi
   if [[ ! -d "$PROFILE" ]]; then
-    if [[ "$OS_NAME" == "Darwin" ]]; then
-      # First run on a Mac: create the dedicated profile and let the user log in
-      # to chatgpt.com in the window that opens. Keeping a dedicated
+    if [[ "$PLATFORM" != "linux" ]]; then
+      # First run on a Mac or WSLg: create the dedicated profile and let the user log
+      # in to chatgpt.com in the window that opens. Keeping a dedicated
       # --user-data-dir matters — Chrome 136+ refuses CDP on the default profile.
-      echo "chatgpt: creating browser profile $PROFILE — log in to chatgpt.com in the Chrome window, then re-run" >&2
+      local where="the Chrome window"
+      [[ "$PLATFORM" == "wslg" ]] && where="the Chrome window on the Windows desktop"
+      echo "chatgpt: creating browser profile $PROFILE — log in to chatgpt.com in $where, then re-run" >&2
       mkdir -p "$PROFILE"
     else
       echo "chatgpt: logged-in browser profile is missing: $PROFILE" >&2
@@ -293,7 +317,14 @@ start_chrome() {
   fi
   pkill -f -- "user-data-dir=$PROFILE" 2>/dev/null || true
   sleep 2
-  # On macOS the window opens on the real desktop; DISPLAY is a Linux/VNC concept.
+  # On macOS the window opens on the real desktop and Chrome finds the GPU itself.
+  # WSLg has no /dev/dri (only /dev/dxg), so plain Chrome there gets no WebGL at all; Mesa's
+  # d3d12 Gallium driver routes GL through DirectX to the Windows GPU. Measured on WSL2 with
+  # an RTX 4090 + AMD iGPU: GALLIUM_DRIVER=d3d12 gives "ANGLE (Microsoft Corporation, D3D12
+  # (NVIDIA GeForce RTX 4090), OpenGL 4.6)" with no extra Chrome flags; without an adapter
+  # name Mesa takes the first adapter (the iGPU), so NVIDIA is requested when nvidia-smi
+  # sees one (CHATGPT_D3D12_ADAPTER overrides; empty lets Mesa pick). VirtualGL is useless
+  # there: its only EGL device is llvmpipe.
   # Xvnc has no GPU, and OpenAI's sentinel bot check needs WebGL. Measured on a headless
   # Ubuntu 24.04 host (Chrome 152): with no WebGL the login "Continue" spinner hangs with
   # zero network traffic; with software WebGL (SwiftShader) it still hangs — the renderer
@@ -301,10 +332,22 @@ start_chrome() {
   # goes through. VirtualGL needs no X server on the GPU, but Chrome's GPU sandbox blocks
   # its X connection, hence --disable-gpu-sandbox. Without VirtualGL fall back to software
   # WebGL (--enable-unsafe-swiftshader is required since ~M131) and say so.
-  local -a display_env=() gl_prefix=() gpu_flags=()
-  local gpu_mode=""
-  if [[ "$OS_NAME" != "Darwin" ]]; then
-    display_env=(env "DISPLAY=$VNC_DISPLAY")
+  local -a launch_env=() gl_prefix=() gpu_flags=()
+  local gpu_mode="" adapter
+  if [[ "$PLATFORM" == "wslg" ]]; then
+    if [[ -v CHATGPT_D3D12_ADAPTER ]]; then
+      adapter="$CHATGPT_D3D12_ADAPTER"
+    elif nvidia-smi -L >/dev/null 2>&1; then
+      adapter=NVIDIA
+    else
+      adapter=""
+    fi
+    # WSLg's X server is always :0.
+    launch_env=(env "DISPLAY=${DISPLAY:-:0}" GALLIUM_DRIVER=d3d12)
+    [[ -n "$adapter" ]] && launch_env+=("MESA_D3D12_DEFAULT_ADAPTER_NAME=$adapter")
+    gpu_mode=" (GPU via WSLg D3D12${adapter:+, adapter $adapter})"
+  elif [[ "$PLATFORM" == "linux" ]]; then
+    launch_env=(env "DISPLAY=$VNC_DISPLAY")
     if [[ "$CHROME_GPU" == "virtualgl" ]]; then
       gl_prefix=("$VGLRUN" -d egl)
       gpu_flags=(--ignore-gpu-blocklist --disable-gpu-sandbox)
@@ -314,7 +357,7 @@ start_chrome() {
       gpu_mode=" (software WebGL — no VirtualGL)"
     fi
   fi
-  spawn_unlocked "${display_env[@]}" nohup "${gl_prefix[@]}" "$CHROME_BIN" \
+  spawn_unlocked "${launch_env[@]}" nohup "${gl_prefix[@]}" "$CHROME_BIN" \
     --remote-debugging-port="$CDP_PORT" \
     --user-data-dir="$PROFILE" \
     --no-first-run --no-default-browser-check --disable-dev-shm-usage \
@@ -350,21 +393,22 @@ start_novnc() {
   echo "chatgpt: started noVNC $NOVNC_PORT" >&2
 }
 
-if [[ "$OS_NAME" == "Darwin" ]]; then
-  # macOS runs headful on the real desktop: no VNC, no noVNC. The Chrome window
+CHROME_GPU="$(recorded_chrome_gpu)"
+if [[ "$PLATFORM" != "linux" ]]; then
+  # macOS and WSLg run headful on the real desktop: no VNC, no noVNC. The Chrome window
   # itself is the observation surface that noVNC provides on headless Linux.
   if cdp_up; then
     echo "chatgpt: reusing Chrome CDP $CDP_PORT" >&2
   else
+    CHROME_GPU="$(chrome_gpu_mode)"
     start_chrome || exit 1
   fi
   {
     echo "# Generated by chatgpt; do not edit while the stack is running."
     echo "CDP_PORT=$CDP_PORT"
+    [[ -n "$CHROME_GPU" ]] && echo "CHROME_GPU=$CHROME_GPU"
   } > "$STATE"
 else
-  CHROME_GPU="$(sed -n -e 's/^CHROME_GPU=virtualgl$/virtualgl/p' \
-    -e 's/^CHROME_GPU=software$/software/p' "$STATE" 2>/dev/null | head -1)"
   DESIRED_CHROME_GPU="$(chrome_gpu_mode)"
   VNC_DISPLAY="$(read_display_from_state "$STATE" || true)"
   if [[ -z "$VNC_DISPLAY" ]]; then
