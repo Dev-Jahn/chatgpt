@@ -29,24 +29,50 @@ except ImportError:  # Unit tests and --help do not require Playwright.
 
 
 CHATGPT_URL = "https://chatgpt.com/"
-INPUT_SELECTORS = ["#prompt-textarea", 'div[contenteditable="true"]']
-FILE_INPUT_SELECTOR = 'input[type="file"]'
-USER_MSG_SELECTORS = ['[data-message-author-role="user"]', 'article[data-turn="user"]']
+# Composer and conversation DOM, measured live 2026-09-26: the composer is a ProseMirror editor in
+# form[data-chatgpt-composer] (placement 'home' or 'thread'); a conversation renders one wrapper per
+# exchange holding a user unit, an assistant unit (both keyed by data-chatgpt-search-unit-key, e.g.
+# 'turn-0:0:user' / 'turn-0:2:assistant', ids in data-chatgpt-search-message-ids) and, once the
+# answer is done, the assistant's .turn-action-controls bar. Pre-2026-09 selectors stay listed after
+# the current ones; the first selector that matches wins.
+COMPOSER_FORM_SELECTOR = "form[data-chatgpt-composer]"
+INPUT_SELECTORS = [
+    f'{COMPOSER_FORM_SELECTOR} [contenteditable="true"][role="textbox"]',
+    "#prompt-textarea",
+    'div[contenteditable="true"]',
+]
+# Three hidden file inputs sit in the composer; the first two accept only images/videos.
+FILE_INPUT_SELECTOR = 'input[type="file"]:not([accept]), input[type="file"][accept=""]'
+USER_MSG_SELECTORS = [
+    '[data-chatgpt-search-unit-key$=":user"]',
+    '[data-message-author-role="user"]',
+    'article[data-turn="user"]',
+]
 ASSISTANT_MSG_SELECTORS = [
+    '[data-chatgpt-search-unit-key$=":assistant"]',
     '[data-message-author-role="assistant"]',
     'article[data-turn="assistant"]',
 ]
+MESSAGE_IDS_ATTR = "data-chatgpt-search-message-ids"  # space-separated; was data-message-id
+ASSISTANT_MARKDOWN_SELECTORS = ['[data-markdown-text-style="assistant-message"]', ".markdown"]
+TURN_ACTIONS_SELECTOR = ".turn-action-controls"
 COPY_BTN_SELECTORS = [
-    'button[data-testid="copy-turn-action-button"]',
+    'button[aria-label="복사"]',
     'button[aria-label="Copy"]',
+    'button[data-testid="copy-turn-action-button"]',
     'button[data-testid*="copy"]',
 ]
+# Not observed on the 2026-09 UI (seeing it needs a prompt in flight); the composer-scoped
+# guesses come first, the old test ids after them.
 STREAMING_BTN_SELECTORS = [
+    f'{COMPOSER_FORM_SELECTOR} button[aria-label*="중지"]',
+    f'{COMPOSER_FORM_SELECTOR} button[aria-label*="stop" i]',
     'button[data-testid="stop-button"]',
     'button[aria-label="Stop streaming"]',
     'button[data-testid*="stop"]',
 ]
 SEND_BTN_SELECTORS = [
+    f'{COMPOSER_FORM_SELECTOR} button[type="submit"]',
     'button[data-testid="send-button"]',
     'button[data-testid="composer-send-button"]',
     'button[aria-label*="send" i]',
@@ -59,21 +85,28 @@ LOGIN_WALL_SELECTORS = [
     'button:has-text("로그인")',
     'button:has-text("Log in")',
 ]
-# Composer model picker — Chat mode, measured live 2026-09-05 (DOM notes: .hippo/briefs/dom-facts.md on
-# dev). The pill opens a two-level menu: a model list (최신/Latest plus explicit versions) behind a toggle and a
-# five-tick effort slider. The pin is the label the CLOSED pill shows at max effort with the Latest
-# model — "6 Pro" is GPT-6 Pro today; below Pro, Latest is labelled by effort alone (an explicit
-# model keeps its version prefix, e.g. "5.6 High").
+# Composer model picker — Chat mode, measured live 2026-09-26. The pill (composer button targeting
+# 'reasoning') opens a menu whose [data-model-picker-view] swaps two panels: 'simple' shows the model
+# row (the view toggle, labelled e.g. "6 Pro") above a five-tick power slider; 'advanced' shows the
+# model list (최신/Latest plus explicit versions) and disables the slider. The selected model is the
+# aria-checked entry of that list (present in the DOM in both views); the [data-explicit-model]
+# flag stays "false" with an explicit model selected, so it is not read. The pin is the label that
+# model row shows at max effort with the Latest model — "6 Pro" is GPT-6 Pro today (the closed pill
+# reads just "Pro" since 2026-09, so it no longer carries the version); below Pro, Latest is labelled
+# by effort alone.
 REQUIRED_PRO_LABEL = "6 Pro"
 LATEST_MODEL_RE = re.compile(r"^(최신|latest|auto)$", re.I)
 EFFORT_LEVELS = ("instant", "medium", "high", "extra high", "pro")  # slider ticks 0..4
-PILL_SELECTOR = 'button.__composer-pill[aria-haspopup="menu"]'
-MODE_RADIO_SELECTOR = '[role="radio"][data-tpp-toggle-value]'
-CHAT_MODE_RADIO_SELECTOR = '[role="radio"][data-tpp-toggle-value="chatgpt"]'
-PICKER_SELECTOR = '[data-testid="composer-intelligence-picker-content"]'
-MODEL_TOGGLE_SELECTOR = f'{PICKER_SELECTOR} [role="menuitem"][aria-expanded]'
+PILL_SELECTOR = f'{COMPOSER_FORM_SELECTOR} button[aria-haspopup="menu"][data-composer-navigation-target="reasoning"]'
+# Chat/Work switch in the page header: two aria-pressed buttons in a role=group. The buttons carry
+# no attribute naming the mode, so their (so far untranslated) text decides.
+MODE_BUTTON_SELECTOR = '[role="group"] > button[aria-pressed]'
+CHAT_MODE_RE = re.compile(r"^(chat|채팅)$", re.I)
+WORK_MODE_RE = re.compile(r"^(work|작업)$", re.I)
+PICKER_SELECTOR = '[role="menu"] [data-model-picker-view]'
+MODEL_TOGGLE_SELECTOR = f'{PICKER_SELECTOR} [role="menuitem"][data-model-picker-view-toggle]'
 MODEL_RADIO_SELECTOR = f'{PICKER_SELECTOR} [role="menuitemradio"]'
-EFFORT_TICK_SELECTOR = "[data-model-reasoning-effort-slider] span[data-selected]"
+EFFORT_TICK_SELECTOR = f"{PICKER_SELECTOR} [data-model-picker-power-slider] span[data-selected]"
 QUOTA_HINTS = [
     "usage limit",
     "reached your limit",
@@ -433,13 +466,19 @@ def count_nodes_strict(page, selectors) -> int:
     raise RuntimeError(f"could not snapshot message counts: {last_error}")
 
 
+MESSAGE_IDS_JS = """els => els.flatMap(e =>
+  (e.getAttribute('%s') || e.getAttribute('data-message-id') || '').split(/\\s+/).filter(Boolean))""" % MESSAGE_IDS_ATTR
+
+
+def node_message_ids(node) -> set[str]:
+    raw = node.get_attribute(MESSAGE_IDS_ATTR) or node.get_attribute("data-message-id") or ""
+    return set(raw.split())
+
+
 def message_ids(page) -> set[str]:
     try:
         return set(
-            page.eval_on_selector_all(
-                "[data-message-id]",
-                "els => els.map(e => e.getAttribute('data-message-id')).filter(Boolean)",
-            )
+            page.eval_on_selector_all(f"[{MESSAGE_IDS_ATTR}], [data-message-id]", MESSAGE_IDS_JS)
         )
     except Exception:
         return set()
@@ -522,7 +561,7 @@ def login_state(page, wait_secs: int = 15) -> str:
                 continue
         try:
             if find_input(page) is not None and (
-                page.query_selector("button.__composer-pill")
+                page.query_selector(PILL_SELECTOR)
                 or page.query_selector(FILE_INPUT_SELECTOR)
             ):
                 return "ok"
@@ -828,48 +867,42 @@ def effort_index(effort: str) -> int:
     return EFFORT_LEVELS.index(name)
 
 
-def read_pill_label(page) -> str:
-    """The closed pill's text is the current selection ('6 Pro', 'High', …). While the menu is
-    open it shows a placeholder, so read it only with the menu closed."""
-    node = _q(page, [PILL_SELECTOR])
-    if node is None:
-        return ""
-    try:
-        return normalize(node.inner_text())
-    except Exception:
-        return ""
+MODE_STATE_JS = """(sel) => [...document.querySelectorAll(sel)]
+  .map(b => [(b.innerText || '').trim(), b.getAttribute('aria-pressed') === 'true'])"""
 
 
 def composer_mode(page) -> str:
-    """'chat' | 'work' | 'none' — 'none' when the page has no Chat/Work toggle at all."""
+    """'chat' | 'work' | 'none' — 'none' when the page has no Chat/Work switch at all."""
     try:
-        radios = page.evaluate(
-            """() => [...document.querySelectorAll('[role="radio"][data-tpp-toggle-value]')]
-                .map(r => [r.getAttribute('data-tpp-toggle-value'), r.getAttribute('aria-checked') === 'true'])"""
-        )
+        buttons = page.evaluate(MODE_STATE_JS, MODE_BUTTON_SELECTOR) or []
     except Exception:
-        radios = []
-    if not radios:
+        buttons = []
+    modes = [
+        ("chat" if CHAT_MODE_RE.match(text) else "work", pressed)
+        for text, pressed in buttons
+        if CHAT_MODE_RE.match(text) or WORK_MODE_RE.match(text)
+    ]
+    if not modes:
         return "none"
-    return "chat" if any(value == "chatgpt" and checked for value, checked in radios) else "work"
+    return "chat" if ("chat", True) in modes else "work"
 
 
 def ensure_chat_mode(page) -> None:
     """Flip a Work-mode composer back to Chat. Chat and Work keep separate model settings, so
-    this never disturbs the Chat selection. A page without the toggle is left alone: the
+    this never disturbs the Chat selection. A page without the switch is left alone: the
     picker checks that follow reject a Work-shaped menu anyway."""
     mode = composer_mode(page)
     if mode != "work":
         return
     log("composer is in Work mode; switching to Chat")
-    for radio in page.query_selector_all(CHAT_MODE_RADIO_SELECTOR):
+    for button in page.query_selector_all(MODE_BUTTON_SELECTOR):
         try:
-            if not radio.is_visible():
+            if not CHAT_MODE_RE.match(normalize(button.inner_text())) or not button.is_visible():
                 continue
             try:
-                radio.click(timeout=5000)
+                button.click(timeout=5000)
             except Exception:
-                radio.dispatch_event("click")
+                button.dispatch_event("click")
             break
         except Exception:
             continue
@@ -904,27 +937,27 @@ def close_menu(page) -> None:
     time.sleep(0.3)
 
 
-PICKER_STATE_JS = """() => {
-  const picker = document.querySelector('[data-testid="composer-intelligence-picker-content"]');
+PICKER_STATE_JS = """(sel) => {
+  const picker = document.querySelector(sel);
   if (!picker) return null;
-  const text = el => (el ? (el.innerText || '') : '').replace(/\\s+/g, ' ').trim();
+  const text = el => (el ? (el.innerText || el.textContent || '') : '').replace(/\\s+/g, ' ').trim();
   const num = el => (el === null || el === undefined) ? null : Number(el);
-  const controls = picker.querySelector('[data-explicit-model]');
-  const toggle = picker.querySelector('[role="menuitem"][aria-expanded]');
-  const effort = toggle && toggle.querySelector('[data-max-effort]');
-  const slider = picker.querySelector('[data-model-reasoning-effort-slider] [role="slider"]');
-  const sliderItem = picker.querySelector('[role="menuitem"][aria-keyshortcuts]');
-  const view = picker.querySelector('[data-view]');
+  const toggle = picker.querySelector('[role="menuitem"][data-model-picker-view-toggle]');
+  const effort = toggle && toggle.querySelector('[data-maximum]');
+  const slider = picker.querySelector('[data-model-picker-power-slider] [role="slider"]');
+  const sliderItem = picker.querySelector('[role="menuitem"][data-reasoning-slider]');
+  const radios = [...picker.querySelectorAll('[role="menuitemradio"]')]
+    .map(r => [text(r), r.getAttribute('aria-checked') === 'true']);
+  const checked = radios.filter(r => r[1]);
   return {
-    view: view ? view.getAttribute('data-view') : null,
-    explicit_model: controls ? controls.getAttribute('data-explicit-model') : null,
+    view: picker.getAttribute('data-model-picker-view'),
+    model: checked.length === 1 ? checked[0][0] : null,
     label: text(toggle),
-    max_effort: effort ? effort.getAttribute('data-max-effort') === 'true' : null,
+    max_effort: effort ? effort.getAttribute('data-maximum') === 'true' : null,
     value_now: slider ? num(slider.getAttribute('aria-valuenow')) : null,
     value_max: slider ? num(slider.getAttribute('aria-valuemax')) : null,
     slider_disabled: sliderItem ? sliderItem.getAttribute('aria-disabled') === 'true' : null,
-    radios: [...picker.querySelectorAll('[role="menuitemradio"]')]
-      .map(r => [text(r), r.getAttribute('aria-checked') === 'true']),
+    radios,
   };
 }"""
 
@@ -932,19 +965,25 @@ PICKER_STATE_JS = """() => {
 def read_picker_state(page) -> dict | None:
     """One snapshot of the open picker, or None when no picker is on the page."""
     try:
-        return page.evaluate(PICKER_STATE_JS)
+        return page.evaluate(PICKER_STATE_JS, PICKER_SELECTOR)
     except Exception:
         return None
 
 
+def latest_selected(state: dict) -> bool:
+    """True only when exactly one model entry is checked and it is Latest."""
+    return bool(state["model"]) and LATEST_MODEL_RE.match(state["model"]) is not None
+
+
 def choose_latest_model(page) -> None:
-    """Expand the model list and pick the Latest entry; confirm the picker no longer reports an
-    explicit model. The slider item is disabled while the list is expanded, so callers close and
-    reopen the menu before touching the slider."""
-    toggle = _q(page, [MODEL_TOGGLE_SELECTOR])
-    if toggle is None:
-        raise ModelVerificationError("model list toggle not found in the picker")
-    if toggle.get_attribute("aria-expanded") != "true":
+    """Switch the picker to its model list and pick the Latest entry; confirm Latest is the checked
+    entry. Picking returns the menu to its simple view, but callers still close and reopen it
+    before touching the slider (it only answers on an untouched menu)."""
+    state = read_picker_state(page)
+    if state is None or state["view"] != "advanced":
+        toggle = _q(page, [MODEL_TOGGLE_SELECTOR])
+        if toggle is None:
+            raise ModelVerificationError("model list toggle not found in the picker")
         try:
             toggle.click(timeout=5000)
         except Exception:
@@ -963,10 +1002,9 @@ def choose_latest_model(page) -> None:
             radio.dispatch_event("click")
         time.sleep(1.3)
         state = read_picker_state(page)
-        if state is None or state["explicit_model"] != "false":
+        if state is None or not latest_selected(state):
             raise ModelVerificationError(
-                f"clicked {text!r} but the picker still reports an explicit model "
-                f"({state and state['label']!r})"
+                f"clicked {text!r} but the picker reports model {state and state['model']!r}"
             )
         return
     raise ModelVerificationError(f"no Latest entry in the model list; the menu offers {seen!r}")
@@ -1007,7 +1045,8 @@ def _reopen_picker(page) -> dict:
 def select_model(page, effort: str) -> str:
     """Land the composer on Chat mode · Latest model · the wanted effort tick, verified.
 
-    At Pro the closed pill must read exactly REQUIRED_PRO_LABEL. Below Pro the UI shows no
+    The verdict always comes from the open picker: Latest (no explicit model) at the wanted tick,
+    and at Pro the model row must read exactly REQUIRED_PRO_LABEL. Below Pro the UI shows no
     model version, so the check there is Latest + tick index."""
     target = effort_index(effort)
     wanted = EFFORT_LEVELS[target]
@@ -1025,46 +1064,49 @@ def select_model(page, effort: str) -> str:
 def _select_model(page, target: int, wanted: str) -> str:
     ensure_chat_mode(page)
 
-    pill = read_pill_label(page)
-    if wanted == "pro" and pill == REQUIRED_PRO_LABEL:
-        log(f"model verified: pill already {REQUIRED_PRO_LABEL!r} (Latest · Pro)")
-        return f"Latest ({REQUIRED_PRO_LABEL})"
-
     if not open_picker(page):
         raise ModelVerificationError("model menu could not be opened")
     state = read_picker_state(page)
     if state is None:
-        raise ModelVerificationError(f"model picker not found after opening the menu; pill read {pill!r}")
+        raise ModelVerificationError("model picker not found after opening the menu")
     if state["value_max"] != len(EFFORT_LEVELS) - 1:
         raise ModelVerificationError(
             f"unexpected effort slider (max tick {state['value_max']!r}, label {state['label']!r}); "
             "is the composer in Work mode?"
         )
-    if state["explicit_model"] != "false":
-        log(f"explicit model selected ({state['label']!r}); switching to Latest")
+    changed = False
+    if state["model"] is None:
+        raise ModelVerificationError(
+            f"cannot tell the selected model; the model list reads {state['radios']!r}"
+        )
+    if not latest_selected(state):
+        log(f"explicit model selected ({state['model']!r}, {state['label']!r}); switching to Latest")
         choose_latest_model(page)
         state = _reopen_picker(page)  # the slider only answers on an untouched menu
+        changed = True
     if state["value_now"] != target:
         log(f"effort tick {state['value_now']} → {target} ({wanted})")
         choose_effort_tick(page, target)
+        changed = True
+    final = _reopen_picker(page) if changed else state
     close_menu(page)
 
-    pill = read_pill_label(page)
-    if wanted == "pro":
-        if pill != REQUIRED_PRO_LABEL:
-            raise ModelVerificationError(f"required label {REQUIRED_PRO_LABEL!r}, pill reads {pill!r}")
-        log(f"model verified: {REQUIRED_PRO_LABEL} (Latest · Pro)")
-        return f"Latest ({REQUIRED_PRO_LABEL})"
-
-    after = _reopen_picker(page)
-    close_menu(page)
-    if after["explicit_model"] != "false" or after["value_now"] != target:
+    if not latest_selected(final) or final["value_now"] != target:
         raise ModelVerificationError(
             f"final check failed: expected Latest at tick {target} ({wanted}), picker reported "
-            f"model={'Latest' if after['explicit_model'] == 'false' else after['label']!r} "
-            f"tick={after['value_now']!r}"
+            f"model={final['model']!r} tick={final['value_now']!r}"
         )
-    log(f"model verified: Latest; effort {wanted} (tick {target}, pill {pill!r}); Latest shows no model version below Pro")
+    if wanted == "pro":
+        if final["label"] != REQUIRED_PRO_LABEL:
+            raise ModelVerificationError(
+                f"required label {REQUIRED_PRO_LABEL!r}, the picker's model row reads {final['label']!r}"
+            )
+        log(f"model verified: {REQUIRED_PRO_LABEL} (Latest · Pro)")
+        return f"Latest ({REQUIRED_PRO_LABEL})"
+    log(
+        f"model verified: Latest; effort {wanted} (tick {target}, label {final['label']!r}); "
+        "Latest shows no model version below Pro"
+    )
     return f"Latest ({wanted})"
 
 
@@ -1078,9 +1120,7 @@ def attach_file(page, path: Path) -> None:
     file_input.set_input_files(str(path))
     log(f"uploading attachment: {path.name}")
     stem = path.stem[:14]
-    composer = page.locator(
-        "form:has(#prompt-textarea), [role='presentation']:has(#prompt-textarea)"
-    ).first
+    composer = page.locator(COMPOSER_FORM_SELECTOR).first
     for _ in range(40):
         try:
             if composer.get_by_text(stem, exact=False).count() > 0:
@@ -1093,12 +1133,16 @@ def attach_file(page, path: Path) -> None:
     raise RuntimeError(f"attachment chip did not appear: {path.name}")
 
 
+# The composer element: the first INPUT_SELECTORS entry present (passed in as `sels`).
+COMPOSER_EL_JS = "sels => sels.map(s => document.querySelector(s)).find(Boolean)"
+
+
 def put_text(page, prompt: str) -> None:
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     page.evaluate(
-        """() => { const el = document.querySelector('#prompt-textarea')
-            || document.querySelector('div[contenteditable="true"]');
-            if (el) { el.scrollIntoView({block: 'center'}); el.focus(); } }"""
+        f"""sels => {{ const el = ({COMPOSER_EL_JS})(sels);
+            if (el) {{ el.scrollIntoView({{block: 'center'}}); el.focus(); }} }}""",
+        INPUT_SELECTORS,
     )
     try:
         page.keyboard.insert_text(prompt)
@@ -1109,9 +1153,9 @@ def put_text(page, prompt: str) -> None:
 
 def composer_text(page) -> str:
     return page.evaluate(
-        """() => { const el = document.querySelector('#prompt-textarea')
-            || document.querySelector('div[contenteditable="true"]');
-            return el ? (el.innerText || el.textContent || '') : ''; }"""
+        f"""sels => {{ const el = ({COMPOSER_EL_JS})(sels);
+            return el ? (el.innerText || el.textContent || '') : ''; }}""",
+        INPUT_SELECTORS,
     ) or ""
 
 
@@ -1122,12 +1166,8 @@ def composer_has_prompt(page, prompt: str) -> bool:
 
 
 def clear_composer(page) -> None:
-    page.evaluate(
-        """() => { const el = document.querySelector('#prompt-textarea')
-            || document.querySelector('div[contenteditable="true"]');
-            if (el) el.focus(); }"""
-    )
-    page.keyboard.press("Control+a")
+    page.evaluate(f"sels => {{ const el = ({COMPOSER_EL_JS})(sels); if (el) el.focus(); }}", INPUT_SELECTORS)
+    page.keyboard.press("ControlOrMeta+a")  # plain Control+a only moves the caret on macOS
     page.keyboard.press("Backspace")
 
 
@@ -1214,10 +1254,10 @@ def fresh_assistant_node(page, base_ids: set[str], base_assistant: int):
     fresh = []
     for index, node in enumerate(nodes):
         try:
-            message_id = node.get_attribute("data-message-id") or ""
+            ids = node_message_ids(node)
         except Exception:
             continue
-        if (message_id and message_id not in base_ids) or (not message_id and index >= base_assistant):
+        if (ids and not ids <= base_ids) or (not ids and index >= base_assistant):
             fresh.append(node)
     return fresh[-1] if fresh else None
 
@@ -1282,7 +1322,7 @@ MARKDOWN_SERIALIZER = r"""
 
 def assistant_markdown(node) -> str:
     try:
-        markdown = node.query_selector(".markdown")
+        markdown = _q(node, ASSISTANT_MARKDOWN_SELECTORS)
         return (markdown or node).evaluate(MARKDOWN_SERIALIZER) or ""
     except Exception:
         try:
@@ -1291,17 +1331,29 @@ def assistant_markdown(node) -> str:
             return ""
 
 
-# Climb from a message to its own turn container: the first ancestor that holds a copy action.
-# Should that ancestor hold other messages too, the copy action belongs to an earlier turn.
+# Climb from the assistant message to its own exchange wrapper: the first ancestor that holds an
+# assistant action bar (the user message carries a bar of its own inside its unit; that one does
+# not count). Should that ancestor hold other assistant messages too, the bar belongs to an earlier
+# exchange. The turn is done once its bar carries the copy action.
 TURN_HAS_COPY_JS = """el => {
-  const copy = %s;
+  const copy = %s, bar = %s, user = %s, assistant = %s;
   let node = el;
   for (let hop = 0; hop < 8 && node; hop++) {
-    if (node.querySelector(copy)) return node.querySelectorAll('[data-message-author-role]').length <= 1;
+    const bars = [...node.querySelectorAll(bar)].filter(b => !b.closest(user));
+    if (bars.length)
+      return node.querySelectorAll(assistant).length <= 1 && bars.some(b => b.querySelector(copy));
     node = node.parentElement;
   }
   return false;
-}""" % json.dumps(", ".join(COPY_BTN_SELECTORS))
+}""" % tuple(
+    json.dumps(value)
+    for value in (
+        ", ".join(COPY_BTN_SELECTORS),
+        TURN_ACTIONS_SELECTOR,
+        ", ".join(USER_MSG_SELECTORS),
+        ", ".join(ASSISTANT_MSG_SELECTORS),
+    )
+)
 
 
 def turn_complete(page, node) -> bool:

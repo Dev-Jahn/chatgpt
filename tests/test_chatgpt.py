@@ -151,13 +151,11 @@ class FakeNode:
         self.page, self.kind, self.index, self.text = page, kind, index, text
 
     def inner_text(self):
-        if self.kind == "pill":
-            return "추론 수준" if self.page.menu_open else self.page.label().replace(" ", "\n")
+        if self.kind == "pill":  # the closed pill no longer carries the model version
+            return "추론 수준" if self.page.menu_open else self.page.label().split()[-1]
         return self.text
 
-    def get_attribute(self, name):
-        if self.kind == "toggle" and name == "aria-expanded":
-            return "true" if self.page.expanded else "false"
+    def get_attribute(self, _name):
         return None
 
     def is_visible(self):
@@ -174,13 +172,18 @@ class FakeNode:
 
 
 class FakePicker:
-    """Just enough of the 2026-09 Chat-mode composer to drive select_model: a Chat/Work toggle,
-    a pill whose closed text is the current selection, and a menu with a model list behind a
-    toggle plus a tick slider that ignores clicks while the list is expanded (measured)."""
+    """Just enough of the 2026-09-26 Chat-mode composer to drive select_model: a Chat/Work switch,
+    a pill that opens the menu, and a menu whose model row (the view toggle) names the selection,
+    with the model list behind that toggle (view 'advanced') and a tick slider that ignores clicks
+    while the list is showing (measured)."""
 
     LABELS = ["Instant", "중간", "High", "매우 높음", "Pro"]
 
-    def __init__(self, *, mode="chat", explicit=False, value=4, value_max=4, radios=None, picker=True):
+    def __init__(
+        self, *, mode="chat", explicit=False, value=4, value_max=4, radios=None, picker=True,
+        pro_label="6 Pro",
+    ):
+        self.pro_label = pro_label
         self.mode = mode
         self.explicit = explicit
         self.value = value
@@ -198,24 +201,24 @@ class FakePicker:
 
     def label(self):
         if self.value == self.value_max:
-            return "5.6 Pro" if self.explicit else "6 Pro"
+            return "5.6 Pro" if self.explicit else self.pro_label
         return self.LABELS[self.value]
 
     def wait_for_selector(self, *_args, **_kwargs):
         return None
 
     def evaluate(self, js, *_args):
-        if "data-tpp-toggle-value" in js:
+        if js == ask_core.MODE_STATE_JS:
             if self.mode is None:
                 return []
-            return [["chatgpt", self.mode == "chat"], ["work", self.mode == "work"]]
-        if "composer-intelligence-picker-content" in js:
+            return [["Chat", self.mode == "chat"], ["Work", self.mode == "work"]]
+        if js == ask_core.PICKER_STATE_JS:
             if not (self.menu_open and self.picker):
                 return None
             checked = "GPT-5.6 Sol" if self.explicit else "최신"
             return {
                 "view": "advanced" if self.expanded else "simple",
-                "explicit_model": "true" if self.explicit else "false",
+                "model": checked if checked in self.radio_names else None,
                 "label": self.label(),
                 "max_effort": self.value == self.value_max,
                 "value_now": self.value,
@@ -232,8 +235,10 @@ class FakePicker:
     def query_selector_all(self, selector):
         if selector == ask_core.PILL_SELECTOR:
             return [FakeNode(self, "pill")]
-        if selector == ask_core.CHAT_MODE_RADIO_SELECTOR:
-            return [FakeNode(self, "chat")] if self.mode else []
+        if selector == ask_core.MODE_BUTTON_SELECTOR:
+            if not self.mode:
+                return []
+            return [FakeNode(self, "work", text="Work"), FakeNode(self, "chat", text="Chat")]
         if not self.menu_open:
             return []
         if selector == ask_core.MODEL_TOGGLE_SELECTOR:
@@ -260,8 +265,8 @@ class FakePicker:
             self.menu_open = True
             self.expanded = False
             self.menu_opens += 1
-        elif node.kind == "chat":
-            self.mode = "chat"
+        elif node.kind in ("chat", "work"):
+            self.mode = node.kind
         elif node.kind == "toggle":
             self.expanded = True
         elif node.kind == "radio":
@@ -276,12 +281,25 @@ class ModelPickerTests(unittest.TestCase):
             result = ask_core.select_model(page, effort)
         return result, stderr.getvalue()
 
-    def test_pill_already_at_pro_skips_the_menu(self):
+    def test_pro_already_selected_is_verified_in_one_menu_open(self):
+        """The closed pill reads only 'Pro' now, so even an untouched run opens the menu once and
+        reads the model row there; nothing is clicked."""
         page = FakePicker()
+        self.assertEqual(FakeNode(page, "pill").inner_text(), "Pro")
         result, log = self.select(page)
         self.assertEqual(result, "Latest (6 Pro)")
-        self.assertEqual(page.menu_opens, 0)
-        self.assertIn("already", log)
+        self.assertEqual(page.menu_opens, 1)
+        self.assertEqual(page.tick_clicks, [])
+        self.assertFalse(page.menu_open)
+        self.assertIn("model verified: 6 Pro", log)
+
+    def test_latest_pro_under_another_label_fails_closed(self):
+        """Latest at the top tick that no longer resolves to 6 Pro must not pass as Pro."""
+        page = FakePicker(pro_label="7 Pro")
+        with self.assertRaises(ask_core.ModelVerificationError) as caught:
+            self.select(page)
+        self.assertIn("'7 Pro'", str(caught.exception))
+        self.assertFalse(page.menu_open)
 
     def test_explicit_model_is_switched_to_latest_before_the_tick_moves(self):
         page = FakePicker(explicit=True, value=2)
@@ -307,6 +325,12 @@ class ModelPickerTests(unittest.TestCase):
         self.assertEqual(page.value, 2)
         self.assertFalse(page.menu_open)
 
+    def test_back_to_pro_from_a_lower_tick(self):
+        page = FakePicker(value=2)
+        result, _ = self.select(page)
+        self.assertEqual(result, "Latest (6 Pro)")
+        self.assertEqual(page.tick_clicks, [(4, False)])
+
     def test_changed_pro_label_fails_closed(self):
         page = FakePicker()
         with mock.patch.object(ask_core, "REQUIRED_PRO_LABEL", "7 Pro"):
@@ -326,6 +350,16 @@ class ModelPickerTests(unittest.TestCase):
         page = FakePicker(value=3, picker=False)
         with self.assertRaises(ask_core.ModelVerificationError):
             self.select(page)
+
+    def test_model_list_without_a_checked_entry_fails_closed(self):
+        """The model is read from the list's checked entry (the old explicit-model flag stays
+        'false' with an explicit model since 2026-09); no checked entry means no verdict."""
+        page = FakePicker(radios=["GPT-5.6 Sol", "GPT-5.5"])
+        with self.assertRaises(ask_core.ModelVerificationError) as caught:
+            self.select(page)
+        self.assertIn("cannot tell the selected model", str(caught.exception))
+        self.assertEqual(page.tick_clicks, [])
+        self.assertFalse(page.menu_open)
 
     def test_menu_without_latest_entry_fails_closed(self):
         page = FakePicker(explicit=True, radios=["GPT-5.6 Sol", "GPT-5.5"])
