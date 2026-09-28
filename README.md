@@ -64,7 +64,9 @@ chatgpt --resume 6a9b8621 "follow-up question"   # a specific thread, by its han
   is not in it — or matches more than one thread — is exit 64 with nothing
   opened. Project grouping does not apply to a follow-up (`--project`/
   `--no-project` are rejected alongside it). A deleted or foreign thread is
-  reported before anything is typed (exit 1).
+  reported before anything is typed (exit 1), and so is a thread whose previous
+  reply is still being generated: a prompt sent then would join that reply
+  instead of starting a new turn.
 - Up to a few runs execute concurrently; excess waits on a lock for up to
   `CHATGPT_LOCK_WAIT` seconds (default 3600).
 - `--effort` takes one of the five slider positions `instant`, `medium`,
