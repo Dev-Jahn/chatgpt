@@ -82,6 +82,17 @@ chatgpt --resume 6a9b8621 "follow-up question"   # a specific thread, by its han
   belongs to another prompt (two prompts sent into one thread seconds apart,
   e.g. from another machine or by hand, can get their answers mixed), the run
   exits 1 with the thread URL and prints nothing.
+- The server checks read only the thread's last exchange (the view the page
+  itself loads), and the whole thread only when this run's turn is not in it.
+  When ChatGPT answers "too many requests" (HTTP 429), a check waits as the
+  server asks (`Retry-After`), otherwise 5 s doubling up to 120 s, logging
+  each wait on stderr: about 2 minutes before a follow-up is typed (then
+  nothing is sent) and about 20 minutes before a harvested answer. If the
+  record still cannot be read then, the run exits 1 with nothing on stdout
+  and saves the answer the page showed to the response file (`--out`)
+  under a first line starting `UNVERIFIED:`; the error names that file and
+  the thread URL. An answer the server files under another prompt is never
+  saved.
 - Up to a few runs execute concurrently; excess waits on a lock for up to
   `CHATGPT_LOCK_WAIT` seconds (default 3600).
 - `--effort` takes one of the five slider positions `instant`, `medium`,
