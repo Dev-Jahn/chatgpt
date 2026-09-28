@@ -684,6 +684,49 @@ class ContinuationFlowTests(unittest.TestCase):
         self.assertIn("접근할 수 없습니다", str(caught.exception))
         page.keyboard.insert_text.assert_not_called()
 
+    def follow_up(self, *, streaming):
+        """ask() following up in CONV on a page whose composer does or does not show the stop
+        button; select_model stops the run where typing would begin."""
+        import itertools
+
+        page = mock.Mock()
+        stop = ask_core.STREAMING_BTN_SELECTORS[0]
+        page.query_selector.side_effect = lambda sel: mock.Mock() if streaming and sel == stop else None
+        playwright = mock.MagicMock()
+        clock = itertools.count(0, 1)
+        with mock.patch.object(ask_core, "sync_playwright", return_value=playwright), mock.patch.multiple(
+            ask_core,
+            port_open=mock.Mock(return_value=True),
+            cdp_browser_ok=mock.Mock(return_value=True),
+            ensure_page_target=mock.Mock(),
+            pick_context=mock.Mock(return_value=mock.Mock(new_page=mock.Mock(return_value=page))),
+            _guard_dialogs=mock.Mock(),
+            login_state=mock.Mock(return_value="ok"),
+            raise_if_rate_limited=mock.Mock(),
+            open_conversation=mock.Mock(return_value=CONV),
+            select_model=mock.Mock(side_effect=RuntimeError("reached typing")),
+            put_text=mock.Mock(),
+            click_send=mock.Mock(),
+            log=mock.Mock(),
+        ), mock.patch.object(ask_core.time, "sleep"), mock.patch.object(
+            ask_core.time, "monotonic", side_effect=lambda: next(clock)
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                ask_core.ask("hi", effort="pro", attach=None, max_wait=60, conversation=CONV)
+            return str(caught.exception), ask_core.put_text, ask_core.click_send
+
+    def test_follow_up_into_a_reply_in_progress_sends_nothing(self):
+        """2026-09-28: a prompt sent while the conversation's previous reply was still running
+        joined that exchange instead of starting a turn, so it could not be confirmed or harvested."""
+        message, put_text, click_send = self.follow_up(streaming=True)
+        self.assertEqual(message, "a reply is still in progress in this conversation; nothing sent")
+        put_text.assert_not_called()
+        click_send.assert_not_called()
+
+    def test_follow_up_into_a_finished_conversation_goes_on_to_type(self):
+        message, _, _ = self.follow_up(streaming=False)
+        self.assertEqual(message, "reached typing")
+
 
 @contextlib.contextmanager
 def held_locks(paths):

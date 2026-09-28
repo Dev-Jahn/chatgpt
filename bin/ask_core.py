@@ -74,6 +74,9 @@ STREAMING_BTN_SELECTORS = [
     'button[aria-label="Stop streaming"]',
     'button[data-testid*="stop"]',
 ]
+# How long a freshly opened conversation is watched for that stop button before a follow-up is
+# typed (see reply_in_progress).
+REPLY_IN_PROGRESS_POLL_SECS = 3
 SEND_BTN_SELECTORS = [
     f'{COMPOSER_FORM_SELECTOR} button[type="submit"]',
     'button[data-testid="send-button"]',
@@ -1254,6 +1257,18 @@ def is_streaming(page) -> bool:
     return _q(page, STREAMING_BTN_SELECTORS) is not None
 
 
+def reply_in_progress(page, secs: float = REPLY_IN_PROGRESS_POLL_SECS) -> bool:
+    """True when the open conversation is still generating an earlier reply. A prompt sent then
+    does not start a new turn: it joins the running exchange (measured 2026-09-28), where it can be
+    neither confirmed nor harvested. Measured 2026-09-28 on freshly opened tabs of a conversation
+    whose Pro reply was running: the composer's stop button (중지) was there within 0.1 s of the
+    composer (27 of 27 opens from 10 s after the send on); a finished conversation never showed it
+    (2 of 2, 30 s each). The short poll is margin for a slower load. Blind spot: a tab that loads
+    the conversation within ~5-10 s of another tab's send shows neither that turn nor the stop
+    button, and never catches up without a reload."""
+    return _poll(lambda: is_streaming(page), secs)
+
+
 def detect_quota(page) -> str | None:
     try:
         surfaces = page.query_selector_all('[role="dialog"], [role="alert"]')
@@ -1482,6 +1497,8 @@ def ask(
             bound_url = None
             if conversation:
                 bound_url = open_conversation(page, conversation)
+                if reply_in_progress(page):
+                    raise RuntimeError("a reply is still in progress in this conversation; nothing sent")
                 log(f"following up in conversation: {bound_url}")
             elif project:
                 if enter_project(page, project):
