@@ -65,8 +65,9 @@ chatgpt --resume 6a9b8621 "follow-up question"   # a specific thread, by its han
   opened. Project grouping does not apply to a follow-up (`--project`/
   `--no-project` are rejected alongside it). A deleted or foreign thread is
   reported before anything is typed (exit 1), and so is a thread whose previous
-  reply is still being generated: a prompt sent then would join that reply
-  instead of starting a new turn.
+  reply is still being generated — judged by the page's stop button and, just
+  before typing, by ChatGPT's server record of the thread's latest exchange: a
+  prompt sent then would join that reply instead of starting a new turn.
 - One run per thread on this machine: a run holds a lock on its conversation
   (`~/.chatgpt/conversations/<id>.lock`) from before it types until its reply is
   harvested or it gives up; a fresh chat takes it as soon as the new thread
@@ -76,10 +77,11 @@ chatgpt --resume 6a9b8621 "follow-up question"   # a specific thread, by its han
 - The reply printed is always the answer to this run's own prompt: the run finds
   its own turn by message id and prompt text, reads only that exchange, and
   before printing checks with ChatGPT's server that the answer belongs to that
-  exchange. When the answer cannot be found or belongs to another prompt (two
-  prompts sent into one thread seconds apart, e.g. from another machine or by
-  hand, can get their answers mixed), the run exits 1 with the thread URL and
-  prints nothing.
+  exchange, follows that prompt and has ended its turn (answers that use tools
+  and sub-agents pass the same check). When the answer cannot be found or
+  belongs to another prompt (two prompts sent into one thread seconds apart,
+  e.g. from another machine or by hand, can get their answers mixed), the run
+  exits 1 with the thread URL and prints nothing.
 - Up to a few runs execute concurrently; excess waits on a lock for up to
   `CHATGPT_LOCK_WAIT` seconds (default 3600).
 - `--effort` takes one of the five slider positions `instant`, `medium`,
