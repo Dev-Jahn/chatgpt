@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import json
 import os
+import random
 import re
 import socket
 import sys
@@ -1512,9 +1513,9 @@ def wait_for_response(
 
 
 # --- the server's record ---------------------------------------------------------------
-# The conversation as the server keeps it, read in full with the page's own session token (the page
-# itself reads only the newest turns, from /backend-api/conversations/<id>?num_turns=10), reduced to
-# each message's parent, role, status, turn_exchange_id and end_turn, and the text of user messages.
+# The conversation as the server keeps it, read with the page's own session token and reduced to
+# each message's parent, role, status, turn_exchange_id and end_turn, the text of user messages, and
+# whether a user message has versions (another prompt answering the same message).
 # Measured 2026-09-28:
 # - Every message of an exchange carries its user turn's turn_exchange_id; the answer the page shows
 #   is the exchange's last message, role assistant, channel 'final', end_turn true (45 messages of
@@ -1526,44 +1527,137 @@ def wait_for_response(
 # - While a Pro reply runs, the conversation's async_status is 3 and the leaf (current_node) is the
 #   user turn or a 'thoughts' message, every message already 'finished_successfully'; once the reply
 #   ends or is stopped, async_status is null and the leaf has end_turn true.
-# - Read every ~3 s for a minute, the endpoint answers 429 ("Too many requests") for minutes after,
-#   on every conversation of the account. A check reads it once per try, and the harvest check,
-#   which would otherwise throw away a finished answer, backs off for minutes before giving up.
-SERVER_CONVERSATION_JS = """async (cid) => {
-  const session = await (await fetch('/api/auth/session')).json();
-  const response = await fetch('/backend-api/conversation/' + cid,
-    {headers: {Authorization: 'Bearer ' + session.accessToken}});
-  if (!response.ok) return {error: 'HTTP ' + response.status};
-  const conversation = await response.json();
-  const messages = {};
-  for (const [id, node] of Object.entries(conversation.mapping || {})) {
-    const message = node.message, role = message ? message.author.role : null;
-    messages[id] = {
-      parent: node.parent || null,
-      role,
-      status: message ? message.status || null : null,
-      exchange: message ? (message.metadata || {}).turn_exchange_id || null : null,
-      end_turn: message ? message.end_turn === true : false,
-      text: role === 'user' ? ((message.content || {}).parts || []).filter(p => typeof p === 'string').join('\\n') : '',
+# - Two endpoints. /backend-api/conversation/<id> returns the whole tree (13.7 MB on the work
+#   thread). The page itself reads /backend-api/conversations/<id>?num_turns=10&include_has_versions=true:
+#   the newest turns of the current branch as a list in branch order (a user prompt and its reply
+#   count as two turns: num_turns=2 is the last exchange, 205 messages and 2.7 MB on the work
+#   thread; num_turns=10 was 16.8 MB, more than the whole tree), with the same role, status, end_turn, channel, recipient, turn_exchange_id and text,
+#   async_status and current_node, page_info.has_previous_page, and has_versions on a user message
+#   whose parent has another child (the sibling prompts of a race thread). It lists no parent of a
+#   user message, and the first reply message's metadata.parent_id names a message that is not in
+#   the tree, so a message's parent is the one listed before it. Other branches are not listed.
+# - Read every ~3 s for a minute, the whole-tree endpoint answered 429 ("Too many requests") for
+#   minutes after, on every conversation of the account, and the page then could not load the
+#   conversation either. So each check reads the last exchange only, widens to the whole tree only
+#   when this run's messages are not in it, and waits out a 429 (Retry-After, else exponential
+#   backoff) instead of reading again.
+SERVER_CONVERSATION_JS = """async ({cid, turns}) => {
+  try {
+    const session = await fetch('/api/auth/session');
+    if (!session.ok) return {error: 'HTTP ' + session.status, status: session.status, retry_after: session.headers.get('retry-after')};
+    const token = (await session.json()).accessToken;
+    const url = turns ? '/backend-api/conversations/' + cid + '?num_turns=' + turns + '&include_has_versions=true'
+                      : '/backend-api/conversation/' + cid;
+    const response = await fetch(url, {headers: {Authorization: 'Bearer ' + token}});
+    if (!response.ok) return {error: 'HTTP ' + response.status, status: response.status, retry_after: response.headers.get('retry-after')};
+    const conversation = await response.json();
+    const text = message => ((message.content || {}).parts || []).filter(p => typeof p === 'string').join('\\n');
+    const reduce = (message, parent) => {
+      const role = message ? message.author.role : null, metadata = (message && message.metadata) || {};
+      return {
+        parent: parent || null,
+        role,
+        status: message ? message.status || null : null,
+        exchange: metadata.turn_exchange_id || null,
+        end_turn: message ? message.end_turn === true : false,
+        versions: metadata.has_versions === true,
+        text: role === 'user' ? text(message) : '',
+      };
     };
+    const messages = {};
+    if (turns) {
+      let previous = null;
+      for (const message of conversation.messages || []) {
+        messages[message.id] = reduce(message, previous);
+        previous = message.id;
+      }
+    } else {
+      for (const [id, node] of Object.entries(conversation.mapping || {})) messages[id] = reduce(node.message, node.parent);
+    }
+    return {
+      current_node: conversation.current_node || null,
+      async_status: conversation.async_status ?? null,
+      complete: turns ? !(conversation.page_info || {}).has_previous_page : true,
+      messages,
+    };
+  } catch (error) {
+    return {error: 'network: ' + String(error).slice(0, 200)};
   }
-  return {current_node: conversation.current_node || null, async_status: conversation.async_status ?? null, messages};
 }"""
-# Waits between reads of the server's record: the harvest check's (about 3 minutes in all), and the
-# pre-send guard's, which holds the submit lock meanwhile and costs nothing to rerun.
-SERVER_CHECK_WAITS = (3, 6, 12, 24, 48, 96)
-SERVER_GUARD_WAITS = (3, 6)
+LAST_EXCHANGE_TURNS = 2
+# Waits between reads: Retry-After when the server sends it, otherwise exponential backoff with
+# jitter from SERVER_BACKOFF_FIRST doubling to SERVER_BACKOFF_MAX seconds, for as long as the check's
+# patience: the harvest's (a finished answer is at stake) and the pre-send guard's (a refused send
+# costs nothing; nothing is typed).
+SERVER_BACKOFF_FIRST = 5
+SERVER_BACKOFF_MAX = 120
+HARVEST_PATIENCE = 20 * 60
+GUARD_PATIENCE = 2 * 60
+# A record that reads fine but lacks this run's messages or leaves them unfinished is waited for about
+# 3 minutes: the page already showed the answer finished, and a mixed race answer stays unfinished.
+RECORD_PATIENCE = 3 * 60
 
 
-def server_conversation(page, conversation_url: str) -> dict:
-    """One read of the server's record (SERVER_CONVERSATION_JS); RuntimeError when it fails."""
+class ServerReadError(RuntimeError):
+    """One read of the server's record failed (HTTP status, network, page)."""
+
+    def __init__(self, problem: str, retry_after: float | None = None):
+        super().__init__(problem)
+        self.retry_after = retry_after
+
+
+class ServerUnreadableError(RuntimeError):
+    """The harvest check could not read the server's record within its patience."""
+
+
+class UnverifiedReplyError(RuntimeError):
+    """The answer was harvested from the page but the server's record could not be read to check it."""
+
+    def __init__(self, message: str, body: str, conversation_url: str):
+        super().__init__(message)
+        self.body, self.conversation_url = body, conversation_url
+
+
+def retry_after_secs(value) -> float | None:
+    """A Retry-After header: delta seconds or an HTTP date."""
+    if value in (None, ""):
+        return None
     try:
-        found = page.evaluate(SERVER_CONVERSATION_JS, conversation_id(conversation_url)) or {}
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+
+        return max(0.0, parsedate_to_datetime(str(value)).timestamp() - time.time())
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+
+
+def server_conversation(page, conversation_url: str, turns: int | None = LAST_EXCHANGE_TURNS) -> dict:
+    """One read of the server's record (SERVER_CONVERSATION_JS): the newest `turns` turns of the
+    current branch, or the whole tree when `turns` is None. ServerReadError when it fails."""
+    try:
+        found = page.evaluate(SERVER_CONVERSATION_JS, {"cid": conversation_id(conversation_url), "turns": turns}) or {}
     except Exception as exc:
-        raise RuntimeError(str(exc).splitlines()[0] if str(exc) else type(exc).__name__) from None
+        raise ServerReadError(str(exc).splitlines()[0] if str(exc) else type(exc).__name__) from None
     if found.get("error") or not isinstance(found.get("messages"), dict):
-        raise RuntimeError(found.get("error") or "no messages in the server's answer")
+        raise ServerReadError(found.get("error") or "no messages in the server's answer", retry_after_secs(found.get("retry_after")))
     return found
+
+
+def server_wait(attempt: int, deadline: float, problem: str, retry_after: float | None = None) -> bool:
+    """Sleep before the next read, or False when that would pass the deadline. One stderr line per wait."""
+    if retry_after is not None:
+        wait = max(1.0, retry_after)
+    else:
+        wait = min(SERVER_BACKOFF_MAX, SERVER_BACKOFF_FIRST * 2**attempt) * random.uniform(0.75, 1.0)
+    if time.monotonic() + wait > deadline:
+        return False
+    reason = "server busy (HTTP 429)" if problem == "HTTP 429" else f"server record: {problem}"
+    log(f"{reason}; retrying in {round(wait)} s")
+    time.sleep(wait)
+    return True
 
 
 def prompt_of(messages: dict, message_id: str) -> str | None:
@@ -1593,20 +1687,22 @@ REPLY_RUNNING = "a reply is still in progress in this conversation; nothing sent
 
 def refuse_if_reply_running(page, conversation_url: str) -> None:
     """Before a follow-up is typed: the composer's stop button (reply_in_progress) is missing from a
-    page that shows a Pro reply as 'Thinking' after a reload, so the server's record decides too.
-    A record that cannot be read refuses the send as well."""
-    problem = ""
-    for wait in (0, *SERVER_GUARD_WAITS):
-        time.sleep(wait)
+    page that shows a Pro reply as 'Thinking' after a reload, so the server's record decides too —
+    its last exchange, which always holds the leaf. A record that cannot be read within
+    GUARD_PATIENCE refuses the send as well."""
+    deadline = time.monotonic() + GUARD_PATIENCE
+    attempt = 0
+    while True:
         try:
             conversation = server_conversation(page, conversation_url)
-        except RuntimeError as exc:
-            problem = str(exc)
-            continue
+        except ServerReadError as exc:
+            if server_wait(attempt, deadline, str(exc), exc.retry_after):
+                attempt += 1
+                continue
+            raise RuntimeError(f"could not read the conversation's state on the server ({exc}); nothing sent") from None
         if server_reply_running(conversation):
             raise RuntimeError(REPLY_RUNNING)
         return
-    raise RuntimeError(f"could not read the conversation's state on the server ({problem}); nothing sent")
 
 
 def verify_reply_exchange(page, conversation_url: str, turn_id: str, reply_ids: set[str], prompt: str) -> None:
@@ -1618,38 +1714,56 @@ def verify_reply_exchange(page, conversation_url: str, turn_id: str, reply_ids: 
     the other's exchange, and the answer that streamed was left 'in_progress' with no text. So this
     run's turn must have no sibling prompt, and the answer must come from this run's exchange
     (turn_exchange_id), follow this run's turn with no other prompt in between (a prompt sent into
-    a running reply shares its exchange), be finished there and end the turn."""
+    a running reply shares its exchange), be finished there and end the turn.
+
+    Reads the last exchange (2.7 MB on the work thread); when this run's messages are not all in it
+    (a later turn, another branch, or a record still being written), the whole tree (13.7 MB; the
+    newest ten turns were 16.8 MB there), which later tries keep reading. When reads
+    keep failing for HARVEST_PATIENCE, ServerUnreadableError; when the record stays incomplete or
+    unfinished for RECORD_PATIENCE, RuntimeError."""
     if not reply_ids:
         raise RuntimeError(f"the reply carries no message id, so it cannot be checked against this run's turn; see {conversation_url}")
     ids = [turn_id, *sorted(reply_ids)]
-    problem = ""
-    for wait in (0, *SERVER_CHECK_WAITS):
-        time.sleep(wait)
+    start = time.monotonic()
+    turns: int | None = LAST_EXCHANGE_TURNS
+    attempt, problem, unreadable, unfinished_seen = 0, "", False, False
+    while True:
+        retry_after = None
         try:
-            messages = server_conversation(page, conversation_url)["messages"]
-        except RuntimeError as exc:
-            problem = str(exc)
-            continue
-        missing = [message_id for message_id in ids if not (messages.get(message_id) or {}).get("role")]
-        if missing:
-            problem = f"not on the server yet: {', '.join(missing)}"
-            continue
-        _refuse_foreign(messages, turn_id, sorted(reply_ids), prompt, conversation_url)
-        unfinished = [message_id for message_id in ids if messages[message_id]["status"] != "finished_successfully"]
-        if not unfinished and any(messages[message_id]["end_turn"] for message_id in reply_ids):
-            return
-        problem = f"not finished on the server: {', '.join(unfinished or sorted(reply_ids))}"
-    raise RuntimeError(
-        f"could not confirm the reply as this run's own on the server ({problem}); "
-        f"nothing returned — read it at {conversation_url}"
-    )
+            conversation = server_conversation(page, conversation_url, turns)
+        except ServerReadError as exc:
+            problem, retry_after, unreadable = str(exc), exc.retry_after, True
+        else:
+            messages = conversation["messages"]
+            missing = [message_id for message_id in ids if not (messages.get(message_id) or {}).get("role")]
+            if missing and turns is not None:
+                turns = None
+                continue  # the whole tree at the same moment, not a retry
+            unreadable = False
+            if missing:
+                problem = f"not on the server yet: {', '.join(missing)}"
+            else:
+                _refuse_foreign(messages, turn_id, sorted(reply_ids), prompt, conversation_url)
+                unfinished = [message_id for message_id in ids if messages[message_id]["status"] != "finished_successfully"]
+                if not unfinished and any(messages[message_id]["end_turn"] for message_id in reply_ids):
+                    return
+                problem = f"not finished on the server: {', '.join(unfinished or sorted(reply_ids))}"
+                unfinished_seen = True
+        deadline = start + (HARVEST_PATIENCE if unreadable else RECORD_PATIENCE)
+        if not server_wait(attempt, deadline, problem, retry_after):
+            break
+        attempt += 1
+    message = f"could not confirm the reply as this run's own on the server ({problem})"
+    if unreadable and not unfinished_seen:  # an answer once seen unfinished is one of the race shapes
+        raise ServerUnreadableError(message)
+    raise RuntimeError(f"{message}; nothing returned — read it at {conversation_url}")
 
 
 def _refuse_foreign(messages: dict, turn_id: str, reply_ids: list[str], prompt: str, conversation_url: str) -> None:
     user = messages[turn_id]
     if user["role"] != "user" or text_key(prompt)[:PROMPT_KEY_CHARS] not in text_key(user["text"]):
         raise ForeignReplyError(f"the server's message {turn_id} is not this run's prompt; see {conversation_url}")
-    if any(
+    if user.get("versions") or any(
         message_id != turn_id and message["parent"] == user["parent"] and message["role"] == "user"
         for message_id, message in messages.items()
     ):
@@ -1806,7 +1920,10 @@ def _ask(
                     _guard_dialogs(context, page)
                     page.goto(conversation_url, wait_until="domcontentloaded", timeout=60000)
                     time.sleep(2)
-            verify_reply_exchange(page, conversation_url, turn_id, reply_ids, prompt)
+            try:
+                verify_reply_exchange(page, conversation_url, turn_id, reply_ids, prompt)
+            except ServerUnreadableError as exc:
+                raise UnverifiedReplyError(str(exc), body, conversation_url) from None
             log(f"reply checked on the server: {', '.join(sorted(reply_ids))} answer turn {turn_id}")
             return Reply(body, conversation_url)
         finally:
@@ -1860,6 +1977,20 @@ def main(
     except RateLimitedError as exc:
         print(f"chatgpt: {exc}", file=sys.stderr)
         return 5
+    except UnverifiedReplyError as exc:
+        # Explicitly marked, never printed as the answer: the page showed it under this run's turn,
+        # but the server's record, which catches the race shapes, could not be read.
+        atomic_write(
+            output,
+            f"UNVERIFIED: not confirmed as the answer to this run's prompt ({exc}); check it at {exc.conversation_url}\n\n"
+            f"{exc.body.strip()}\n",
+        )
+        print(
+            f"chatgpt: {exc}; the answer the page showed is saved, marked UNVERIFIED, at {output} — "
+            f"check it at {exc.conversation_url}",
+            file=sys.stderr,
+        )
+        return 1
     except KeyboardInterrupt:
         print("chatgpt: interrupted", file=sys.stderr)
         return 130

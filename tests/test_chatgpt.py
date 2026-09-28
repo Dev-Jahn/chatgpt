@@ -159,6 +159,39 @@ def conversation(*rows, async_status=None, current=None):
     return {"current_node": current or rows[-1][0], "async_status": async_status, "messages": messages}
 
 
+@contextlib.contextmanager
+def server_clock():
+    """time.sleep advances time.monotonic; yields the sleeps and the log mock."""
+    now, sleeps = [0.0], []
+
+    def sleep(secs):
+        sleeps.append(secs)
+        now[0] += secs
+
+    with mock.patch.object(ask_core.time, "sleep", side_effect=sleep), mock.patch.object(
+        ask_core.time, "monotonic", side_effect=lambda: now[0]
+    ), mock.patch.object(ask_core, "log") as log:
+        yield sleeps, log
+
+
+BUSY = {"error": "HTTP 429", "status": 429, "retry_after": None}
+
+
+def window(server, first, complete=False):
+    """The light endpoint's view of `server`: the current branch from message `first` on, listed
+    in branch order (parent = the message listed before), no other branch."""
+    path, node = [], server["current_node"]
+    while node:
+        path.append(node)
+        node = server["messages"][node]["parent"]
+    path = path[::-1][path[::-1].index(first):]
+    messages, previous = {}, None
+    for message_id in path:
+        messages[message_id] = {**server["messages"][message_id], "parent": previous}
+        previous = message_id
+    return {**server, "complete": complete, "messages": messages}
+
+
 FINAL = {"end_turn": True}
 # Synthetic trees shaped like the records measured 2026-09-28 (see ask_core's server section).
 EARLIER = [
@@ -781,9 +814,9 @@ class ContinuationFlowTests(unittest.TestCase):
         page = mock.Mock()
         stop = ask_core.STREAMING_BTN_SELECTORS[0]
         page.query_selector.side_effect = lambda sel: mock.Mock() if streaming and sel == stop else None
-        page.evaluate.side_effect = lambda js, *_: (server or conversation(*FINISHED)) if js == ask_core.SERVER_CONVERSATION_JS else CONV
+        answers = server if callable(server) else (lambda: server or conversation(*FINISHED))
+        page.evaluate.side_effect = lambda js, *_: answers() if js == ask_core.SERVER_CONVERSATION_JS else CONV
         playwright = mock.MagicMock()
-        clock = itertools.count(0, 1)
         with thread_state(), mock.patch.object(ask_core, "sync_playwright", return_value=playwright), mock.patch.multiple(
             ask_core,
             port_open=mock.Mock(return_value=True),
@@ -798,10 +831,7 @@ class ContinuationFlowTests(unittest.TestCase):
             message_ids=mock.Mock(return_value=set()),
             put_text=mock.Mock(side_effect=RuntimeError("reached typing")),
             click_send=mock.Mock(),
-            log=mock.Mock(),
-        ), mock.patch.object(ask_core.time, "sleep"), mock.patch.object(
-            ask_core.time, "monotonic", side_effect=lambda: next(clock)
-        ):
+        ), server_clock() as (self.sleeps, _):
             with self.assertRaises(RuntimeError) as caught:
                 ask_core.ask("hi", effort="pro", attach=None, max_wait=60, conversation=CONV)
             return str(caught.exception), ask_core.put_text, ask_core.click_send
@@ -843,9 +873,17 @@ class ContinuationFlowTests(unittest.TestCase):
             self.assertEqual(self.follow_up(streaming=False, server=server)[0], "reached typing", name)
 
     def test_follow_up_is_refused_when_the_server_record_cannot_be_read(self):
-        message, put_text, _ = self.follow_up(streaming=False, server={"error": "HTTP 429"})
+        """A 429 before sending is waited out for about 2 minutes; after that nothing is sent."""
+        message, put_text, click_send = self.follow_up(streaming=False, server=BUSY)
         self.assertIn("could not read the conversation's state on the server (HTTP 429); nothing sent", message)
         put_text.assert_not_called()
+        click_send.assert_not_called()
+        self.assertTrue(ask_core.GUARD_PATIENCE - ask_core.SERVER_BACKOFF_MAX <= sum(self.sleeps) <= ask_core.GUARD_PATIENCE)
+        answers = iter([BUSY, {**BUSY, "retry_after": "20"}])
+        message, _, _ = self.follow_up(streaming=False, server=lambda: next(answers, conversation(*FINISHED)))
+        self.assertEqual(message, "reached typing")
+        self.assertEqual(self.sleeps[-1], 20.0)  # Retry-After
+        self.assertTrue(3.75 <= self.sleeps[-2] <= 5, self.sleeps)
 
 
 class FakeAnswer:
@@ -958,7 +996,7 @@ class HarvestBindingTests(unittest.TestCase):
     def verify(self, server, reply_ids=("b2-answer",), turn="b2-turn", prompt=PROMPT):
         page = mock.Mock()
         page.evaluate.side_effect = server if callable(server) else (lambda *_: server)
-        with mock.patch.object(ask_core.time, "sleep"):
+        with server_clock() as (self.sleeps, self.log):
             ask_core.verify_reply_exchange(page, CONV, turn, set(reply_ids), prompt)
         return page
 
@@ -975,7 +1013,8 @@ class HarvestBindingTests(unittest.TestCase):
         page = self.verify(self.server())
         js, arg = page.evaluate.call_args[0]
         self.assertEqual(js, ask_core.SERVER_CONVERSATION_JS)
-        self.assertEqual(arg, "6a9b8621-0250-83ee-93ed-50f50ee5d7bd")
+        self.assertEqual(arg, {"cid": "6a9b8621-0250-83ee-93ed-50f50ee5d7bd", "turns": 2})  # the last exchange only
+        page.evaluate.assert_called_once()
 
     def test_server_check_accepts_an_agentic_answer(self):
         """The work thread 6ab7a0f7 (1,716 messages, measured 2026-09-28): an answer is the last of
@@ -1039,16 +1078,140 @@ class HarvestBindingTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.verify({}, reply_ids=())
 
-    def test_server_check_outlasts_minutes_of_429_before_giving_up_a_finished_answer(self):
+    def test_server_check_honours_retry_after_then_backs_off_with_jitter(self):
         """Measured 2026-09-28: after a minute of reads every ~3 s the endpoint answered 429 for
-        minutes, and a finished answer was thrown away after 12 s of retries."""
-        reads = len(ask_core.SERVER_CHECK_WAITS) + 1
-        answers = iter([{"error": "HTTP 429"}] * (reads - 1) + [self.server()])
+        minutes. A 429 is waited out, never read through."""
+        answers = iter([{**BUSY, "retry_after": "37"}, self.server()])
+        self.verify(lambda *_: next(answers))
+        self.assertEqual(self.sleeps, [37.0])
+        self.log.assert_called_once_with("server busy (HTTP 429); retrying in 37 s")
+        answers = iter([BUSY, BUSY, BUSY, self.server()])
+        self.verify(lambda *_: next(answers))
+        self.assertEqual(len(self.sleeps), 3)
+        for sleep, step in zip(self.sleeps, (5, 10, 20)):
+            self.assertTrue(0.75 * step <= sleep <= step, (sleep, step))
+
+    def test_harvest_check_waits_about_20_minutes_of_429_then_reports_it_unreadable(self):
         page = mock.Mock()
-        page.evaluate.side_effect = lambda *_: next(answers)
-        with mock.patch.object(ask_core.time, "sleep") as sleep:
-            ask_core.verify_reply_exchange(page, CONV, "b2-turn", {"b2-answer"}, PROMPT)
-        self.assertGreaterEqual(sum(call.args[0] for call in sleep.call_args_list), 180)
+        page.evaluate.return_value = BUSY
+        with server_clock() as (sleeps, log):
+            with self.assertRaises(ask_core.ServerUnreadableError) as caught:
+                ask_core.verify_reply_exchange(page, CONV, "b2-turn", {"b2-answer"}, PROMPT)
+        self.assertIn("HTTP 429", str(caught.exception))
+        self.assertLessEqual(max(sleeps), ask_core.SERVER_BACKOFF_MAX)
+        self.assertTrue(ask_core.HARVEST_PATIENCE - ask_core.SERVER_BACKOFF_MAX <= sum(sleeps) <= ask_core.HARVEST_PATIENCE, sum(sleeps))
+        self.assertEqual(page.evaluate.call_count, len(sleeps) + 1)  # one read per wait, none in between
+        self.assertEqual(log.call_count, len(sleeps))
+        # A Retry-After beyond the patience left ends the wait at once.
+        page.evaluate.return_value = {**BUSY, "retry_after": "3600"}
+        with server_clock() as (sleeps, _):
+            with self.assertRaises(ask_core.ServerUnreadableError):
+                ask_core.verify_reply_exchange(page, CONV, "b2-turn", {"b2-answer"}, PROMPT)
+        self.assertEqual(sleeps, [])
+
+    def test_an_answer_once_seen_unfinished_is_never_left_unverified(self):
+        """The mixed race answer stays 'in_progress'; a 429 after that must not turn it into an
+        UNVERIFIED answer on disk."""
+        answers = iter([self.server(answer={"status": "in_progress", "end_turn": False})])
+        with self.assertRaises(RuntimeError) as caught:
+            self.verify(lambda *_: next(answers, BUSY))
+        self.assertNotIsInstance(caught.exception, ask_core.ServerUnreadableError)
+        self.assertIn("nothing returned", str(caught.exception))
+
+    def light(self, full, first, complete=False):
+        """A server that answers a light read with window(full, first) and a whole-tree read with
+        `full`; records each read's turns."""
+        reads = []
+
+        def evaluate(_js, arg):
+            reads.append(arg["turns"])
+            return full if arg["turns"] is None else window(full, first, complete)
+
+        return evaluate, reads
+
+    def test_light_read_falls_back_to_one_whole_tree_read_when_this_runs_messages_are_not_in_it(self):
+        later = [("l-turn", "b2-answer", "user", "x-l", {"text": "later"}), ("l-final", "l-turn", "assistant", "x-l", FINAL)]
+        # This run's exchange is the last one: one light read.
+        evaluate, reads = self.light(self.server(), "b2-turn")
+        self.verify(evaluate)
+        self.assertEqual(reads, [2])
+        # Another turn came after it, or another branch is current: one read of the whole tree.
+        for complete in (False, True):
+            evaluate, reads = self.light(self.server(extra=later), "l-turn", complete)
+            self.verify(evaluate)
+            self.assertEqual(reads, [2, None])
+        # A record still being written is read again as a whole tree, after a wait.
+        late = self.server()
+        del late["messages"]["b2-answer"]
+        late["current_node"] = "b2-recap"
+        answers = iter([window(late, "b2-turn"), late, self.server()])
+        reads = []
+        self.verify(lambda _js, arg: reads.append(arg["turns"]) or next(answers))
+        self.assertEqual((reads, len(self.sleeps)), ([2, None, None], 1))
+
+    def test_light_read_refuses_the_race_shapes_as_the_whole_tree_does(self):
+        """The light endpoint lists only the current branch but marks a prompt that has a sibling
+        with has_versions (measured on the race thread 6ab9ff2c); a streamed message from the other
+        branch is not listed, so the whole tree decides."""
+        sibling = window(self.server(), "e-turn", complete=True)
+        sibling["messages"]["b2-turn"]["versions"] = True
+        with self.assertRaises(ask_core.ForeignReplyError) as caught:
+            self.verify(sibling)
+        self.assertIn("sibling branch", str(caught.exception))
+        foreign = window(self.server(answer={"exchange": "x-a2"}), "b2-turn")
+        with self.assertRaises(ask_core.ForeignReplyError):
+            self.verify(foreign)
+        joined = window(conversation(*JOINED), "j-turn")
+        with self.assertRaises(ask_core.ForeignReplyError) as caught:
+            self.verify(joined, reply_ids=("j-final",), turn="j-turn", prompt="Round 2")
+        self.assertIn("answers another prompt", str(caught.exception))
+        streamed = ("a2-stream", "e-final", "assistant", "x-a2", {"status": "in_progress"})
+        mixed = self.server(extra=[streamed])
+        mixed["current_node"] = "b2-answer"
+        evaluate, reads = self.light(mixed, "b2-turn", complete=False)
+        with self.assertRaises(ask_core.ForeignReplyError) as caught:
+            self.verify(evaluate, reply_ids=("a2-stream", "b2-answer"))
+        self.assertIn("belongs to another prompt's exchange", str(caught.exception))
+        self.assertEqual(reads, [2, None])
+
+    def test_an_unreadable_record_at_harvest_saves_the_answer_marked_unverified(self):
+        """20 minutes of 429 after a finished answer: nothing on stdout, exit 1, and the page's
+        answer on disk under an UNVERIFIED first line, its path and the thread URL in the error."""
+        page = mock.Mock()
+        page.evaluate.side_effect = lambda js, *_: BUSY if js == ask_core.SERVER_CONVERSATION_JS else CONV
+        with thread_state(), mock.patch.object(ask_core, "sync_playwright", return_value=mock.MagicMock()), mock.patch.multiple(
+            ask_core,
+            port_open=mock.Mock(return_value=True),
+            cdp_browser_ok=mock.Mock(return_value=True),
+            ensure_page_target=mock.Mock(),
+            pick_context=mock.Mock(return_value=mock.Mock(new_page=mock.Mock(return_value=page))),
+            _guard_dialogs=mock.Mock(),
+            login_state=mock.Mock(return_value="ok"),
+            raise_if_rate_limited=mock.Mock(),
+            enter_project=mock.Mock(return_value=True),
+            select_model=mock.Mock(),
+            message_ids=mock.Mock(return_value=set()),
+            put_text=mock.Mock(),
+            composer_has_prompt=mock.Mock(return_value=True),
+            click_send=mock.Mock(),
+            confirm_sent_and_capture=mock.Mock(return_value=(CONV, "b2-turn")),
+            release_submit_lock=mock.Mock(),
+            current_url=mock.Mock(return_value=CONV),
+            wait_for_response=mock.Mock(return_value=("PONG-B2", {"b2-answer"})),
+        ), server_clock() as (sleeps, log), tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "answer.md"
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = ask_core.main(["--out", str(output), PROMPT], stdin=io.StringIO())
+            self.assertEqual((code, stdout.getvalue()), (1, ""))
+            saved = output.read_text(encoding="utf-8").splitlines()
+            self.assertTrue(saved[0].startswith("UNVERIFIED: "), saved[0])
+            self.assertIn(CONV, saved[0])
+            self.assertEqual(saved[1:], ["", "PONG-B2"])
+            self.assertIn(f"marked UNVERIFIED, at {output.resolve()}", stderr.getvalue())
+            self.assertIn(f"check it at {CONV}", stderr.getvalue())
+            self.assertGreaterEqual(sum(sleeps), ask_core.HARVEST_PATIENCE - ask_core.SERVER_BACKOFF_MAX)
+            self.assertIn("server busy (HTTP 429); retrying in", log.call_args_list[-1].args[0])
 
     def test_a_foreign_reply_is_exit_1_with_nothing_printed(self):
         def foreign(*_args, **_kwargs):
