@@ -29,12 +29,14 @@ except ImportError:  # Unit tests and --help do not require Playwright.
 
 
 CHATGPT_URL = "https://chatgpt.com/"
-# Composer and conversation DOM, measured live 2026-09-26: the composer is a ProseMirror editor in
-# form[data-chatgpt-composer] (placement 'home' or 'thread'); a conversation renders one wrapper per
-# exchange holding a user unit, an assistant unit (both keyed by data-chatgpt-search-unit-key, e.g.
-# 'turn-0:0:user' / 'turn-0:2:assistant', ids in data-chatgpt-search-message-ids) and, once the
-# answer is done, the assistant's .turn-action-controls bar. Pre-2026-09 selectors stay listed after
-# the current ones; the first selector that matches wins.
+# Composer and conversation DOM, measured live 2026-09-26 and rechecked 2026-09-28: the composer is a
+# ProseMirror editor in form[data-chatgpt-composer] (placement 'home' or 'thread'); a conversation
+# renders one [data-turn-key] wrapper per exchange holding a user unit, an assistant unit (both keyed
+# by data-chatgpt-search-unit-key, e.g. 'fallback-turn-0:0:user' / 'fallback-turn-0:2:assistant'
+# since 2026-09-28, 'turn-0:…' before; ids in data-chatgpt-search-message-ids) and, once the answer
+# is done, the assistant's .turn-action-controls bar. The page loads only the newest turns of a long
+# thread, so turns are told apart by id, not by position or count. Pre-2026-09 selectors stay listed
+# after the current ones; the first selector that matches wins.
 COMPOSER_FORM_SELECTOR = "form[data-chatgpt-composer]"
 INPUT_SELECTORS = [
     f'{COMPOSER_FORM_SELECTOR} [contenteditable="true"][role="textbox"]',
@@ -56,14 +58,15 @@ ASSISTANT_MSG_SELECTORS = [
 MESSAGE_IDS_ATTR = "data-chatgpt-search-message-ids"  # space-separated; was data-message-id
 ASSISTANT_MARKDOWN_SELECTORS = ['[data-markdown-text-style="assistant-message"]', ".markdown"]
 TURN_ACTIONS_SELECTOR = ".turn-action-controls"
+# The assistant bar's copy action (measured 복사); the user unit's own bar labels its copy 메시지 복사.
 COPY_BTN_SELECTORS = [
     'button[aria-label="복사"]',
     'button[aria-label="Copy"]',
     'button[data-testid="copy-turn-action-button"]',
     'button[data-testid*="copy"]',
 ]
-# Not observed on the 2026-09 UI (seeing it needs a prompt in flight); the composer-scoped
-# guesses come first, the old test ids after them.
+# Measured 2026-09-28 with a prompt in flight: the composer's submit slot turns into a plain button
+# labelled 중지 (Stop) until the answer is done. The old test ids follow.
 STREAMING_BTN_SELECTORS = [
     f'{COMPOSER_FORM_SELECTOR} button[aria-label*="중지"]',
     f'{COMPOSER_FORM_SELECTOR} button[aria-label*="stop" i]',
@@ -432,19 +435,6 @@ def _qa(page, selectors):
 
 def normalize(text: str | None) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
-
-
-def count_nodes(page, selectors) -> int:
-    if isinstance(selectors, str):
-        selectors = [selectors]
-    for selector in selectors:
-        try:
-            nodes = page.query_selector_all(selector)
-        except Exception:
-            continue
-        if nodes:
-            return len(nodes)
-    return 0
 
 
 def count_nodes_strict(page, selectors) -> int:
@@ -1202,22 +1192,53 @@ def release_submit_lock() -> None:
     log("submit lock released")
 
 
-def confirm_sent_and_capture(page, base_user: int, bound_url: str | None = None) -> str:
+def new_user_turn(page, base_user: int, base_ids: set[str]) -> bool:
+    """True once the last user turn on the page is one it did not show before the send. Judged by
+    message id: from 2026-09-27 follow-ups in a long agentic thread landed while the page's user-turn
+    count stayed flat (that page shows only its newest turns, fetched with `num_turns=10`), so a
+    count is no proof either way. Turns without ids (pre-2026-09 DOM) fall back to the count."""
+    nodes = _qa(page, USER_MSG_SELECTORS)
+    if not nodes:
+        return False
+    try:
+        ids = node_message_ids(nodes[-1])
+    except Exception:
+        return False
+    if ids:
+        return not ids <= base_ids
+    return len(nodes) > base_user
+
+
+def _poll(check: Callable[[], bool], secs: float) -> bool:
+    deadline = time.monotonic() + secs
+    while time.monotonic() < deadline:
+        if check():
+            return True
+        time.sleep(1)
+    return False
+
+
+def confirm_sent_and_capture(
+    page, base_user: int, base_ids: set[str], bound_url: str | None = None
+) -> str:
     """Wait for the send to register, then return the conversation URL. In a fresh chat the URL
     flipping to /c/<id> is as good as a new user turn; when following up (bound_url) the page
-    already carries that URL, so only the new user turn counts."""
-    deadline = time.monotonic() + 45
-    sent = False
-    while time.monotonic() < deadline:
-        if count_nodes(page, USER_MSG_SELECTORS) > base_user:
-            sent = True
-            break
-        if bound_url is None and CONV_URL_RE.search(current_url(page)):
-            sent = True
-            break
-        time.sleep(1)
-    if not sent:
-        raise RuntimeError("no new user turn appeared after send")
+    already carries that URL, so only a new user turn counts. A follow-up whose turn the live page
+    never shows gets one reload of the conversation, and the turn must then be there."""
+
+    def sent() -> bool:
+        if new_user_turn(page, base_user, base_ids):
+            return True
+        return bound_url is None and CONV_URL_RE.search(current_url(page)) is not None
+
+    if not _poll(sent, 45):
+        if bound_url is None:
+            raise RuntimeError("no new user turn appeared after send")
+        log("no new user turn on the live page; reloading the conversation to look for it")
+        page.goto(bound_url, wait_until="domcontentloaded", timeout=60000)
+        if not _poll(sent, 30):
+            raise RuntimeError("no new user turn appeared after send (nor after reloading the conversation)")
+        log("new user turn found after reload")
     if bound_url is not None:
         return bound_url
     deadline = time.monotonic() + 90
@@ -1489,7 +1510,7 @@ def ask(
                     raise RuntimeError("prompt did not enter the composer intact")
             raise_if_rate_limited(page, "rate limited before submit; nothing sent")
             click_send(page)
-            conversation_url = confirm_sent_and_capture(page, base_user, bound_url)
+            conversation_url = confirm_sent_and_capture(page, base_user, base_ids, bound_url)
             log(f"thread bound: {thread_handle(conversation_id(conversation_url))} ({conversation_url})")
             try:
                 record_thread(conversation_url, prompt)
