@@ -1511,32 +1511,102 @@ def wait_for_response(
     raise ResponseTimeoutError("response wait timed out")
 
 
-# The server's record of the given messages: role, status, turn_exchange_id (every message of one
-# exchange carries its user turn's value; measured 2026-09-28 on 45 messages of two scratch threads),
-# the text, and for a user message the other user messages that reply to the same parent. Read with
-# the page's own session token from the endpoint the page itself calls.
-SERVER_MESSAGES_JS = """async ({cid, ids}) => {
+# --- the server's record ---------------------------------------------------------------
+# The conversation as the server keeps it, read in full with the page's own session token (the page
+# itself reads only the newest turns, from /backend-api/conversations/<id>?num_turns=10), reduced to
+# each message's parent, role, status, turn_exchange_id and end_turn, and the text of user messages.
+# Measured 2026-09-28:
+# - Every message of an exchange carries its user turn's turn_exchange_id; the answer the page shows
+#   is the exchange's last message, role assistant, channel 'final', end_turn true (45 messages of
+#   two scratch threads, and the 1,716-message agentic work thread 6ab7a0f7, whose answers sit after
+#   up to 417 tool calls, tool outputs, commentary, hidden sub-agent notes and plan updates, all
+#   'finished_successfully' under the same exchange id; the page lists only the final message).
+# - A prompt sent into a running reply becomes the child of that reply's latest message and joins
+#   its exchange (same turn_exchange_id); the earlier prompt is left without an answer.
+# - While a Pro reply runs, the conversation's async_status is 3 and the leaf (current_node) is the
+#   user turn or a 'thoughts' message, every message already 'finished_successfully'; once the reply
+#   ends or is stopped, async_status is null and the leaf has end_turn true.
+# - Read every ~3 s for a minute, the endpoint answers 429 ("Too many requests") for minutes after,
+#   on every conversation of the account. A check reads it once per try, and the harvest check,
+#   which would otherwise throw away a finished answer, backs off for minutes before giving up.
+SERVER_CONVERSATION_JS = """async (cid) => {
   const session = await (await fetch('/api/auth/session')).json();
   const response = await fetch('/backend-api/conversation/' + cid,
     {headers: {Authorization: 'Bearer ' + session.accessToken}});
   if (!response.ok) return {error: 'HTTP ' + response.status};
-  const mapping = (await response.json()).mapping || {};
-  const role = id => mapping[id] && mapping[id].message && mapping[id].message.author.role;
-  const out = {};
-  for (const id of ids) {
-    const node = mapping[id], message = node && node.message;
-    const parent = node && mapping[node.parent];
-    out[id] = message ? {
-      role: role(id),
-      status: message.status || null,
-      exchange: (message.metadata || {}).turn_exchange_id || null,
-      text: ((message.content || {}).parts || []).filter(part => typeof part === 'string').join('\\n'),
-      sibling_prompts: parent ? parent.children.filter(c => c !== id && role(c) === 'user').length : 0,
-    } : null;
+  const conversation = await response.json();
+  const messages = {};
+  for (const [id, node] of Object.entries(conversation.mapping || {})) {
+    const message = node.message, role = message ? message.author.role : null;
+    messages[id] = {
+      parent: node.parent || null,
+      role,
+      status: message ? message.status || null : null,
+      exchange: message ? (message.metadata || {}).turn_exchange_id || null : null,
+      end_turn: message ? message.end_turn === true : false,
+      text: role === 'user' ? ((message.content || {}).parts || []).filter(p => typeof p === 'string').join('\\n') : '',
+    };
   }
-  return out;
+  return {current_node: conversation.current_node || null, async_status: conversation.async_status ?? null, messages};
 }"""
-SERVER_CHECK_TRIES = 5
+# Waits between reads of the server's record: the harvest check's (about 3 minutes in all), and the
+# pre-send guard's, which holds the submit lock meanwhile and costs nothing to rerun.
+SERVER_CHECK_WAITS = (3, 6, 12, 24, 48, 96)
+SERVER_GUARD_WAITS = (3, 6)
+
+
+def server_conversation(page, conversation_url: str) -> dict:
+    """One read of the server's record (SERVER_CONVERSATION_JS); RuntimeError when it fails."""
+    try:
+        found = page.evaluate(SERVER_CONVERSATION_JS, conversation_id(conversation_url)) or {}
+    except Exception as exc:
+        raise RuntimeError(str(exc).splitlines()[0] if str(exc) else type(exc).__name__) from None
+    if found.get("error") or not isinstance(found.get("messages"), dict):
+        raise RuntimeError(found.get("error") or "no messages in the server's answer")
+    return found
+
+
+def prompt_of(messages: dict, message_id: str) -> str | None:
+    """The user turn a message answers: its nearest user ancestor on the server's tree."""
+    node = messages.get(message_id)
+    for _ in range(len(messages)):
+        if node is None or node["parent"] is None:
+            return None
+        parent = node["parent"]
+        node = messages.get(parent)
+        if node is not None and node["role"] == "user":
+            return parent
+    return None
+
+
+def server_reply_running(conversation: dict) -> bool:
+    """The server is still generating the reply at the conversation's leaf: async_status is set and
+    the leaf is not an answer that ended its turn. Only the leaf counts: an earlier prompt left
+    without an answer further up does not block."""
+    leaf = conversation["messages"].get(conversation.get("current_node") or "")
+    ended = leaf is not None and leaf["role"] == "assistant" and leaf["end_turn"]
+    return conversation.get("async_status") is not None and not ended
+
+
+REPLY_RUNNING = "a reply is still in progress in this conversation; nothing sent"
+
+
+def refuse_if_reply_running(page, conversation_url: str) -> None:
+    """Before a follow-up is typed: the composer's stop button (reply_in_progress) is missing from a
+    page that shows a Pro reply as 'Thinking' after a reload, so the server's record decides too.
+    A record that cannot be read refuses the send as well."""
+    problem = ""
+    for wait in (0, *SERVER_GUARD_WAITS):
+        time.sleep(wait)
+        try:
+            conversation = server_conversation(page, conversation_url)
+        except RuntimeError as exc:
+            problem = str(exc)
+            continue
+        if server_reply_running(conversation):
+            raise RuntimeError(REPLY_RUNNING)
+        return
+    raise RuntimeError(f"could not read the conversation's state on the server ({problem}); nothing sent")
 
 
 def verify_reply_exchange(page, conversation_url: str, turn_id: str, reply_ids: set[str], prompt: str) -> None:
@@ -1545,41 +1615,44 @@ def verify_reply_exchange(page, conversation_url: str, turn_id: str, reply_ids: 
     sent from a page that did not yet show another run's fresh turn replies to the same message as
     that turn (a sibling branch), both generations run at once, and the server mixes them — the
     other run's answer streamed into this run's wrapper, the server filed one run's final text under
-    the other's exchange, and the answer that streamed was left 'in_progress' with no text. So the
-    answer must come from this run's exchange (turn_exchange_id), be finished there, and this run's
-    turn must have no sibling prompt."""
+    the other's exchange, and the answer that streamed was left 'in_progress' with no text. So this
+    run's turn must have no sibling prompt, and the answer must come from this run's exchange
+    (turn_exchange_id), follow this run's turn with no other prompt in between (a prompt sent into
+    a running reply shares its exchange), be finished there and end the turn."""
     if not reply_ids:
         raise RuntimeError(f"the reply carries no message id, so it cannot be checked against this run's turn; see {conversation_url}")
     ids = [turn_id, *sorted(reply_ids)]
     problem = ""
-    for attempt in range(SERVER_CHECK_TRIES):
-        if attempt:
-            time.sleep(3)
+    for wait in (0, *SERVER_CHECK_WAITS):
+        time.sleep(wait)
         try:
-            found = page.evaluate(SERVER_MESSAGES_JS, {"cid": conversation_id(conversation_url), "ids": ids}) or {}
-        except Exception as exc:
-            problem = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+            messages = server_conversation(page, conversation_url)["messages"]
+        except RuntimeError as exc:
+            problem = str(exc)
             continue
-        missing = [message_id for message_id in ids if not found.get(message_id)]
-        if found.get("error") or missing:
-            problem = found.get("error") or f"not on the server yet: {', '.join(missing)}"
+        missing = [message_id for message_id in ids if not (messages.get(message_id) or {}).get("role")]
+        if missing:
+            problem = f"not on the server yet: {', '.join(missing)}"
             continue
-        _refuse_foreign(found, turn_id, sorted(reply_ids), prompt, conversation_url)
-        unfinished = [message_id for message_id in ids if found[message_id]["status"] != "finished_successfully"]
-        if not unfinished:
+        _refuse_foreign(messages, turn_id, sorted(reply_ids), prompt, conversation_url)
+        unfinished = [message_id for message_id in ids if messages[message_id]["status"] != "finished_successfully"]
+        if not unfinished and any(messages[message_id]["end_turn"] for message_id in reply_ids):
             return
-        problem = f"not finished on the server: {', '.join(unfinished)}"
+        problem = f"not finished on the server: {', '.join(unfinished or sorted(reply_ids))}"
     raise RuntimeError(
         f"could not confirm the reply as this run's own on the server ({problem}); "
         f"nothing returned — read it at {conversation_url}"
     )
 
 
-def _refuse_foreign(found: dict, turn_id: str, reply_ids: list[str], prompt: str, conversation_url: str) -> None:
-    user = found[turn_id]
+def _refuse_foreign(messages: dict, turn_id: str, reply_ids: list[str], prompt: str, conversation_url: str) -> None:
+    user = messages[turn_id]
     if user["role"] != "user" or text_key(prompt)[:PROMPT_KEY_CHARS] not in text_key(user["text"]):
         raise ForeignReplyError(f"the server's message {turn_id} is not this run's prompt; see {conversation_url}")
-    if user["sibling_prompts"]:
+    if any(
+        message_id != turn_id and message["parent"] == user["parent"] and message["role"] == "user"
+        for message_id, message in messages.items()
+    ):
         raise ForeignReplyError(
             "another prompt was sent in reply to the same message as this run's (a sibling branch), and the "
             f"server mixes such answers; nothing returned — see {conversation_url}"
@@ -1588,12 +1661,18 @@ def _refuse_foreign(found: dict, turn_id: str, reply_ids: list[str], prompt: str
     foreign = [
         message_id
         for message_id in reply_ids
-        if found[message_id]["role"] != "assistant" or not exchange or found[message_id]["exchange"] != exchange
+        if messages[message_id]["role"] != "assistant" or not exchange or messages[message_id]["exchange"] != exchange
     ]
     if foreign:
         raise ForeignReplyError(
             "the answer shown under this run's prompt belongs to another prompt's exchange "
             f"(messages {', '.join(foreign)}); nothing returned — see {conversation_url}"
+        )
+    later = [message_id for message_id in reply_ids if prompt_of(messages, message_id) != turn_id]
+    if later:
+        raise ForeignReplyError(
+            "the answer shown under this run's prompt answers another prompt sent after it into the same exchange "
+            f"(messages {', '.join(later)}); nothing returned — see {conversation_url}"
         )
 
 
@@ -1666,7 +1745,7 @@ def _ask(
             if conversation:
                 bound_url = open_conversation(page, conversation)
                 if reply_in_progress(page):
-                    raise RuntimeError("a reply is still in progress in this conversation; nothing sent")
+                    raise RuntimeError(REPLY_RUNNING)
                 log(f"following up in conversation: {bound_url}")
             elif project:
                 if enter_project(page, project):
@@ -1684,6 +1763,8 @@ def _ask(
                 attach_file(page, attach)
 
             base_ids = message_ids(page)
+            if bound_url is not None:
+                refuse_if_reply_running(page, bound_url)
 
             put_text(page, prompt)
             if not composer_has_prompt(page, prompt):

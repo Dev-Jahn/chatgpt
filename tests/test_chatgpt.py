@@ -147,6 +147,65 @@ PROMPT = "GUARD-B2: reply with exactly the word PONG-B2 and nothing else."
 OTHER_PROMPT = "GUARD-A2: Write a numbered list from 1 to 1500; on each line the English word."
 
 
+def conversation(*rows, async_status=None, current=None):
+    """The server's record as SERVER_CONVERSATION_JS returns it. Rows are (id, parent, role,
+    exchange, overrides); the leaf is the last row unless `current` names another."""
+    messages = {"root": {"parent": None, "role": None, "status": None, "exchange": None, "end_turn": False, "text": ""}}
+    for message_id, parent, role, exchange, *overrides in rows:
+        messages[message_id] = {
+            "parent": parent, "role": role, "status": "finished_successfully", "exchange": exchange,
+            "end_turn": False, "text": "", **(overrides[0] if overrides else {}),
+        }
+    return {"current_node": current or rows[-1][0], "async_status": async_status, "messages": messages}
+
+
+FINAL = {"end_turn": True}
+# Synthetic trees shaped like the records measured 2026-09-28 (see ask_core's server section).
+EARLIER = [
+    ("e-turn", "root", "user", "x-e", {"text": "earlier question"}),
+    ("e-final", "e-turn", "assistant", "x-e", FINAL),
+]
+PLAIN = EARLIER + [
+    ("b2-turn", "e-final", "user", "x-b2", {"text": PROMPT}),
+    ("b2-thoughts", "b2-turn", "assistant", "x-b2"),
+    ("b2-recap", "b2-thoughts", "assistant", "x-b2"),
+    ("b2-answer", "b2-recap", "assistant", "x-b2", FINAL),
+]
+FINISHED = PLAIN
+RUNNING = EARLIER + [  # async_status 3: the leaf is the turn, then a 'thoughts' message
+    ("r-turn", "e-final", "user", "x-r", {"text": "next"}),
+    ("r-thoughts", "r-turn", "assistant", "x-r"),
+]
+STOPPED = EARLIER + [  # stopped by hand: async_status null, the recap ends the turn
+    ("s-turn", "e-final", "user", "x-s", {"text": "next"}),
+    ("s-thoughts", "s-turn", "assistant", "x-s"),
+    ("s-commentary", "s-thoughts", "assistant", "x-s"),
+    ("s-recap", "s-commentary", "assistant", "x-s", FINAL),
+]
+AGENTIC = EARLIER + [
+    ("a-turn", "e-final", "user", "x-a", {"text": "Round 3: run the agents"}),
+    ("a-thoughts", "a-turn", "assistant", "x-a"),
+    ("a-exec", "a-thoughts", "assistant", "x-a"),  # recipient container.exec, code
+    ("a-output", "a-exec", "tool", "x-a"),  # execution_output
+    ("a-plan", "a-output", "assistant", "x-a"),  # turn_plan.update_turn_plan, commentary
+    ("a-call", "a-plan", "assistant", "x-a"),  # api_tool.call_tool
+    ("a-tool", "a-call", "tool", "x-a"),  # code, commentary
+    ("a-sub", "a-tool", "assistant", "x-a"),  # SubAgentActivityThreadItem.completed, hidden
+    ("a-note", "a-sub", "assistant", "x-a"),  # text, commentary
+    ("a-recap", "a-note", "assistant", "x-a"),  # reasoning_recap
+    ("a-final", "a-recap", "assistant", "x-a", FINAL),  # text, final
+]
+JOINED = EARLIER + [
+    ("j-turn", "e-final", "user", "x-j", {"text": "Round 2"}),
+    ("j-thoughts", "j-turn", "assistant", "x-j"),
+    ("j-recap", "j-thoughts", "assistant", "x-j"),
+    ("j-resend", "j-recap", "user", "x-j", {"text": "Round 2 again"}),
+    ("j-exec", "j-resend", "assistant", "x-j"),
+    ("j-output", "j-exec", "tool", "x-j"),
+    ("j-final", "j-output", "assistant", "x-j", FINAL),
+]
+
+
 class FakeUnit:
     def __init__(self, message_id, text="earlier question"):
         self.message_id, self.text = message_id, text
@@ -713,14 +772,16 @@ class ContinuationFlowTests(unittest.TestCase):
         self.assertIn("접근할 수 없습니다", str(caught.exception))
         page.keyboard.insert_text.assert_not_called()
 
-    def follow_up(self, *, streaming):
+    def follow_up(self, *, streaming, server=None):
         """ask() following up in CONV on a page whose composer does or does not show the stop
-        button; select_model stops the run where typing would begin."""
+        button and whose server record is `server` (default: finished); put_text stops the run
+        where typing would begin."""
         import itertools
 
         page = mock.Mock()
         stop = ask_core.STREAMING_BTN_SELECTORS[0]
         page.query_selector.side_effect = lambda sel: mock.Mock() if streaming and sel == stop else None
+        page.evaluate.side_effect = lambda js, *_: (server or conversation(*FINISHED)) if js == ask_core.SERVER_CONVERSATION_JS else CONV
         playwright = mock.MagicMock()
         clock = itertools.count(0, 1)
         with thread_state(), mock.patch.object(ask_core, "sync_playwright", return_value=playwright), mock.patch.multiple(
@@ -733,8 +794,9 @@ class ContinuationFlowTests(unittest.TestCase):
             login_state=mock.Mock(return_value="ok"),
             raise_if_rate_limited=mock.Mock(),
             open_conversation=mock.Mock(return_value=CONV),
-            select_model=mock.Mock(side_effect=RuntimeError("reached typing")),
-            put_text=mock.Mock(),
+            select_model=mock.Mock(),
+            message_ids=mock.Mock(return_value=set()),
+            put_text=mock.Mock(side_effect=RuntimeError("reached typing")),
             click_send=mock.Mock(),
             log=mock.Mock(),
         ), mock.patch.object(ask_core.time, "sleep"), mock.patch.object(
@@ -755,6 +817,35 @@ class ContinuationFlowTests(unittest.TestCase):
     def test_follow_up_into_a_finished_conversation_goes_on_to_type(self):
         message, _, _ = self.follow_up(streaming=False)
         self.assertEqual(message, "reached typing")
+
+    def test_follow_up_is_refused_when_the_server_is_still_writing_the_leaf_reply(self):
+        """A page reloaded during a Pro reply can show 'Thinking' without the stop button; measured
+        2026-09-28 on a scratch thread, the server then reports async_status 3 with the user turn or
+        a 'thoughts' message as the leaf."""
+        for leaf in (RUNNING, RUNNING[:3]):
+            message, put_text, click_send = self.follow_up(streaming=False, server=conversation(*leaf, async_status=3))
+            self.assertEqual(message, ask_core.REPLY_RUNNING)
+            put_text.assert_not_called()
+            click_send.assert_not_called()
+
+    def test_only_the_leaf_exchange_can_hold_a_follow_up_back(self):
+        """Measured 2026-09-28: a finished or stopped reply leaves async_status null and a leaf that
+        ends its turn; an earlier prompt that never got an answer (the work thread's 22:20 send)
+        sits further up and does not count, and neither does a flag left on an ended leaf."""
+        free = {
+            "finished": conversation(*FINISHED),
+            "stopped": conversation(*STOPPED),
+            "unanswered prompt further up": conversation(*JOINED),
+            "flag on an ended leaf": conversation(*FINISHED, async_status=3),
+        }
+        for name, server in free.items():
+            self.assertFalse(ask_core.server_reply_running(server), name)
+            self.assertEqual(self.follow_up(streaming=False, server=server)[0], "reached typing", name)
+
+    def test_follow_up_is_refused_when_the_server_record_cannot_be_read(self):
+        message, put_text, _ = self.follow_up(streaming=False, server={"error": "HTTP 429"})
+        self.assertIn("could not read the conversation's state on the server (HTTP 429); nothing sent", message)
+        put_text.assert_not_called()
 
 
 class FakeAnswer:
@@ -864,34 +955,53 @@ class HarvestBindingTests(unittest.TestCase):
             self.harvest(page)
         self.assertIn("outside an exchange wrapper", str(caught.exception))
 
-    def verify(self, server, reply_ids=("b2-answer",)):
+    def verify(self, server, reply_ids=("b2-answer",), turn="b2-turn", prompt=PROMPT):
         page = mock.Mock()
         page.evaluate.side_effect = server if callable(server) else (lambda *_: server)
         with mock.patch.object(ask_core.time, "sleep"):
-            ask_core.verify_reply_exchange(page, CONV, "b2-turn", set(reply_ids), PROMPT)
+            ask_core.verify_reply_exchange(page, CONV, turn, set(reply_ids), prompt)
         return page
 
     @staticmethod
-    def server(turn=None, answer=None):
-        """The server's record of b2's turn and of the answer b2 read, as SERVER_MESSAGES_JS returns it."""
-        base_turn = {"role": "user", "status": "finished_successfully", "exchange": "x-b2", "text": PROMPT, "sibling_prompts": 0}
-        base_answer = {"role": "assistant", "status": "finished_successfully", "exchange": "x-b2", "text": "PONG-B2", "sibling_prompts": 0}
-        return {"b2-turn": {**base_turn, **(turn or {})}, "b2-answer": {**base_answer, **(answer or {})}}
+    def server(turn=None, answer=None, extra=()):
+        """b2's plain exchange (turn, thoughts, recap, final) after one earlier exchange, as
+        SERVER_CONVERSATION_JS returns it; `turn`/`answer` override fields of b2's turn and answer."""
+        server = conversation(*PLAIN, *extra)
+        server["messages"]["b2-turn"].update(turn or {})
+        server["messages"]["b2-answer"].update(answer or {})
+        return server
 
     def test_server_check_accepts_the_finished_answer_of_this_runs_exchange(self):
         page = self.verify(self.server())
         js, arg = page.evaluate.call_args[0]
-        self.assertEqual(js, ask_core.SERVER_MESSAGES_JS)
-        self.assertEqual(arg, {"cid": "6a9b8621-0250-83ee-93ed-50f50ee5d7bd", "ids": ["b2-turn", "b2-answer"]})
+        self.assertEqual(js, ask_core.SERVER_CONVERSATION_JS)
+        self.assertEqual(arg, "6a9b8621-0250-83ee-93ed-50f50ee5d7bd")
+
+    def test_server_check_accepts_an_agentic_answer(self):
+        """The work thread 6ab7a0f7 (1,716 messages, measured 2026-09-28): an answer is the last of
+        up to 417 messages under the turn's exchange id — code sent to container.exec or
+        api_tool.call_tool, tool execution_output and code messages, commentary text, sub-agent
+        notes hidden from the page, turn_plan updates, thoughts and a reasoning recap — and the page
+        lists only the final message."""
+        self.verify(conversation(*AGENTIC), reply_ids=("a-final",), turn="a-turn", prompt="Round 3: run the agents")
+
+    def test_server_check_binds_a_prompt_sent_into_a_running_reply_to_its_own_answer(self):
+        """The work thread's 22:20 send got no answer: a resend two minutes later became the child of
+        its reasoning recap and joined its exchange. The final answer belongs to the resend only."""
+        self.verify(conversation(*JOINED), reply_ids=("j-final",), turn="j-resend", prompt="Round 2 again")
+        with self.assertRaises(ask_core.ForeignReplyError) as caught:
+            self.verify(conversation(*JOINED), reply_ids=("j-final",), turn="j-turn", prompt="Round 2")
+        self.assertIn("answers another prompt sent after it into the same exchange", str(caught.exception))
 
     def test_server_check_refuses_every_shape_of_the_measured_race(self):
         """Measured 2026-09-28 (b2, and again with the lock bypassed): b2's prompt forked a sibling of
         a2's turn, a2's answer streamed into b2's wrapper under a2's exchange id and was left
         'in_progress' on the server; a2 itself saw its own answer under its own exchange id, but the
         server had filed b2's final text there."""
+        a2 = [("a2-turn", "e-final", "user", "x-a2", {"text": OTHER_PROMPT})]
         shapes = {
             "another prompt's exchange": self.server(answer={"exchange": "x-a2"}),
-            "sibling branch": self.server(turn={"sibling_prompts": 1}),
+            "sibling branch": self.server(extra=a2),
             "not this run's prompt": self.server(turn={"text": OTHER_PROMPT}),
             "another prompt's exchange ": self.server(turn={"exchange": None}, answer={"exchange": None}),
         }
@@ -899,16 +1009,28 @@ class HarvestBindingTests(unittest.TestCase):
             with self.assertRaises(ask_core.ForeignReplyError, msg=expected) as caught:
                 self.verify(server)
             self.assertIn(expected.strip(), str(caught.exception))
-        with self.assertRaises(RuntimeError) as caught:
-            self.verify(self.server(answer={"status": "in_progress", "text": ""}))
-        self.assertIn("not finished on the server: b2-answer", str(caught.exception))
+        # The unit that showed a2's list streaming lists that message and b2's final one.
+        streamed = ("a2-stream", "b2-recap", "assistant", "x-b2", {"status": "in_progress"})
+        mixed = self.server(extra=[streamed])
+        mixed["messages"]["b2-answer"]["parent"] = "a2-stream"
+        for server, reply_ids in (
+            (self.server(answer={"status": "in_progress", "end_turn": False}), ("b2-answer",)),
+            (mixed, ("a2-stream", "b2-answer")),
+            (self.server(answer={"end_turn": False}), ("b2-answer",)),  # an answer that has not ended its turn
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                self.verify(server, reply_ids=reply_ids)
+            self.assertNotIsInstance(caught.exception, ask_core.ForeignReplyError)
+            self.assertIn("not finished on the server", str(caught.exception))
 
     def test_server_check_waits_for_a_late_record_but_fails_loudly_when_it_cannot_run(self):
-        late = iter([self.server(answer={"status": "in_progress"}), {"b2-turn": self.server()["b2-turn"]}, self.server()])
+        missing = self.server()
+        del missing["messages"]["b2-answer"]
+        late = iter([self.server(answer={"status": "in_progress", "end_turn": False}), missing, {"error": "HTTP 429"}, self.server()])
         self.verify(lambda *_: next(late))
         for server in (
             {"error": "HTTP 401"},
-            {"b2-turn": self.server()["b2-turn"], "b2-answer": None},
+            missing,
             mock.Mock(side_effect=RuntimeError("Target page has been closed")),
         ):
             with self.assertRaises(RuntimeError) as caught:
@@ -916,6 +1038,17 @@ class HarvestBindingTests(unittest.TestCase):
             self.assertIn("could not confirm the reply", str(caught.exception))
         with self.assertRaises(RuntimeError):
             self.verify({}, reply_ids=())
+
+    def test_server_check_outlasts_minutes_of_429_before_giving_up_a_finished_answer(self):
+        """Measured 2026-09-28: after a minute of reads every ~3 s the endpoint answered 429 for
+        minutes, and a finished answer was thrown away after 12 s of retries."""
+        reads = len(ask_core.SERVER_CHECK_WAITS) + 1
+        answers = iter([{"error": "HTTP 429"}] * (reads - 1) + [self.server()])
+        page = mock.Mock()
+        page.evaluate.side_effect = lambda *_: next(answers)
+        with mock.patch.object(ask_core.time, "sleep") as sleep:
+            ask_core.verify_reply_exchange(page, CONV, "b2-turn", {"b2-answer"}, PROMPT)
+        self.assertGreaterEqual(sum(call.args[0] for call in sleep.call_args_list), 180)
 
     def test_a_foreign_reply_is_exit_1_with_nothing_printed(self):
         def foreign(*_args, **_kwargs):
