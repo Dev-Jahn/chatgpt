@@ -143,6 +143,51 @@ class EffortArgTests(unittest.TestCase):
                 ask_core.parse_args(["--effort", bad, "hi"])
 
 
+class FakeUnit:
+    def __init__(self, message_id):
+        self.message_id = message_id
+
+    def get_attribute(self, name):
+        return self.message_id if name == ask_core.MESSAGE_IDS_ATTR else None
+
+
+class FakeThread:
+    """The 2026-09-28 conversation page as confirm_sent_and_capture sees it: user units keyed
+    '…:user' with ids in data-chatgpt-search-message-ids. The page may keep only the newest
+    `window` turns mounted, so a new turn can push the oldest out. `send_after` polls after the
+    click the sent turn appears on the live page (None: never); `on_reload` makes it appear once
+    the conversation is reloaded."""
+
+    def __init__(self, turns, *, send_after, window=None, on_reload=False, with_ids=True):
+        self.with_ids, self.window = with_ids, window
+        self.users = [self.unit(f"old-{n}") for n in range(turns)]
+        self.send_after, self.on_reload, self.polls = send_after, on_reload, 0
+        self.goto = mock.Mock(side_effect=self.reload)
+
+    def unit(self, message_id):
+        return FakeUnit(message_id if self.with_ids else None)
+
+    def ids(self):
+        return {unit.message_id for unit in self.users if unit.message_id}
+
+    def land(self):
+        self.users.append(self.unit("sent"))
+        if self.window:
+            self.users = self.users[-self.window :]
+
+    def tick(self):
+        self.polls += 1
+        if self.polls == self.send_after:
+            self.land()
+
+    def reload(self, *_args, **_kwargs):
+        if self.on_reload:
+            self.land()
+
+    def query_selector_all(self, selector):
+        return list(self.users) if selector == ask_core.USER_MSG_SELECTORS[0] else []
+
+
 class FakeNode:
     TICK_X0 = 100
     TICK_STEP = 50
@@ -573,30 +618,48 @@ class ContinuationFlowTests(unittest.TestCase):
             ],
         )
 
-    def test_follow_up_send_is_confirmed_by_a_new_user_turn_only(self):
-        counts = iter([1, 1, 2])
-        with mock.patch.object(ask_core, "count_nodes", side_effect=lambda *_: next(counts)), mock.patch.object(
-            ask_core, "current_url", return_value=CONV
-        ), mock.patch.object(ask_core.time, "sleep"):
-            self.assertEqual(ask_core.confirm_sent_and_capture(mock.Mock(), 1, CONV), CONV)
+    def confirm(self, thread, bound_url=CONV):
+        """confirm_sent_and_capture against a FakeThread, on a clock that steps 10 s per poll."""
+        import itertools
+
+        base_user, base_ids = len(thread.users), thread.ids()
+        clock = itertools.count(0, 10)
+        with mock.patch.object(ask_core, "current_url", return_value=CONV), mock.patch.object(
+            ask_core.time, "sleep", side_effect=lambda _s: thread.tick()
+        ), mock.patch.object(ask_core.time, "monotonic", side_effect=lambda: next(clock)), mock.patch.object(
+            ask_core, "log"
+        ):
+            return ask_core.confirm_sent_and_capture(thread, base_user, base_ids, bound_url)
+
+    def test_follow_up_is_confirmed_by_a_new_turn_id_while_the_count_stays_flat(self):
+        """The 2026-09-27 regression: the prompt landed, but the long thread's page never showed
+        more user turns than before, so a count-based check exited 1 after a successful send."""
+        thread = FakeThread(5, send_after=2, window=5)
+        self.assertEqual(self.confirm(thread), CONV)
+        self.assertEqual(len(thread.users), 5)
+        thread.goto.assert_not_called()
+
+    def test_follow_up_reloads_once_when_the_live_page_never_shows_the_turn(self):
+        thread = FakeThread(5, send_after=None, on_reload=True)
+        self.assertEqual(self.confirm(thread), CONV)
+        thread.goto.assert_called_once()
+        self.assertEqual(thread.goto.call_args[0][0], CONV)
 
     def test_follow_up_never_takes_the_bound_url_as_proof_of_sending(self):
         """In a fresh chat the URL flipping to /c/<id> proves the send; a follow-up page carries
-        that URL from the start, so the same shortcut would report a send that never happened."""
-        import itertools
+        that URL from the start, so the same shortcut would report a send that never happened —
+        and a reload that still shows no new turn fails too."""
+        thread = FakeThread(1, send_after=None, on_reload=False)
+        with self.assertRaises(RuntimeError) as caught:
+            self.confirm(thread)
+        self.assertIn("no new user turn", str(caught.exception))
+        thread.goto.assert_called_once()
+        self.assertEqual(self.confirm(FakeThread(0, send_after=None), bound_url=None), CONV)
 
-        clock = itertools.count(0, 10)
-        with mock.patch.object(ask_core, "count_nodes", return_value=1), mock.patch.object(
-            ask_core, "current_url", return_value=CONV
-        ), mock.patch.object(ask_core.time, "sleep"), mock.patch.object(
-            ask_core.time, "monotonic", side_effect=lambda: next(clock)
-        ):
-            with self.assertRaises(RuntimeError):
-                ask_core.confirm_sent_and_capture(mock.Mock(), 1, CONV)
-        with mock.patch.object(ask_core, "count_nodes", return_value=0), mock.patch.object(
-            ask_core, "current_url", return_value=CONV
-        ), mock.patch.object(ask_core.time, "sleep"):
-            self.assertEqual(ask_core.confirm_sent_and_capture(mock.Mock(), 0), CONV)
+    def test_turns_without_ids_fall_back_to_the_count(self):
+        self.assertEqual(self.confirm(FakeThread(1, send_after=1, with_ids=False)), CONV)
+        with self.assertRaises(RuntimeError):
+            self.confirm(FakeThread(1, send_after=None, with_ids=False))
 
     def test_open_conversation_returns_the_url_the_page_settles_on(self):
         page = mock.Mock()
