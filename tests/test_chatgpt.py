@@ -116,19 +116,19 @@ class ComposerTests(unittest.TestCase):
 
 
 class ResponseCompletionTests(unittest.TestCase):
-    def test_turn_is_complete_only_when_its_own_turn_shows_the_copy_action(self):
-        """Older turns (and the user's own turn) keep copy buttons, so completion is decided
-        on the fresh assistant node's turn, never on a page-wide count."""
-        node = mock.Mock()
+    def test_exchange_is_complete_only_when_its_own_bar_shows_the_copy_action(self):
+        """Older exchanges (and the user's own bar) keep copy buttons, so completion is decided
+        on this run's exchange wrapper, never on a page-wide count."""
+        exchange = mock.Mock()
         with mock.patch.object(ask_core, "is_streaming", return_value=False):
-            node.evaluate.return_value = True
-            self.assertTrue(ask_core.turn_complete(mock.Mock(), node))
-            node.evaluate.return_value = False
-            self.assertFalse(ask_core.turn_complete(mock.Mock(), node))
-            self.assertEqual(node.evaluate.call_args[0][0], ask_core.TURN_HAS_COPY_JS)
+            exchange.evaluate.return_value = True
+            self.assertTrue(ask_core.exchange_complete(mock.Mock(), exchange))
+            exchange.evaluate.return_value = False
+            self.assertFalse(ask_core.exchange_complete(mock.Mock(), exchange))
+            self.assertEqual(exchange.evaluate.call_args[0][0], ask_core.EXCHANGE_DONE_JS)
         with mock.patch.object(ask_core, "is_streaming", return_value=True):
-            node.evaluate.return_value = True
-            self.assertFalse(ask_core.turn_complete(mock.Mock(), node))
+            exchange.evaluate.return_value = True
+            self.assertFalse(ask_core.exchange_complete(mock.Mock(), exchange))
 
 
 class EffortArgTests(unittest.TestCase):
@@ -143,12 +143,19 @@ class EffortArgTests(unittest.TestCase):
                 ask_core.parse_args(["--effort", bad, "hi"])
 
 
+PROMPT = "GUARD-B2: reply with exactly the word PONG-B2 and nothing else."
+OTHER_PROMPT = "GUARD-A2: Write a numbered list from 1 to 1500; on each line the English word."
+
+
 class FakeUnit:
-    def __init__(self, message_id):
-        self.message_id = message_id
+    def __init__(self, message_id, text="earlier question"):
+        self.message_id, self.text = message_id, text
 
     def get_attribute(self, name):
         return self.message_id if name == ask_core.MESSAGE_IDS_ATTR else None
+
+    def inner_text(self):
+        return self.text
 
 
 class FakeThread:
@@ -158,20 +165,22 @@ class FakeThread:
     click the sent turn appears on the live page (None: never); `on_reload` makes it appear once
     the conversation is reloaded."""
 
-    def __init__(self, turns, *, send_after, window=None, on_reload=False, with_ids=True):
+    def __init__(self, turns, *, send_after, window=None, on_reload=False, with_ids=True, also=()):
         self.with_ids, self.window = with_ids, window
         self.users = [self.unit(f"old-{n}") for n in range(turns)]
         self.send_after, self.on_reload, self.polls = send_after, on_reload, 0
+        self.also = list(also)  # (id, text) of other runs' turns that land with this one
         self.goto = mock.Mock(side_effect=self.reload)
 
-    def unit(self, message_id):
-        return FakeUnit(message_id if self.with_ids else None)
+    def unit(self, message_id, text="earlier question"):
+        return FakeUnit(message_id if self.with_ids else None, text)
 
     def ids(self):
         return {unit.message_id for unit in self.users if unit.message_id}
 
     def land(self):
-        self.users.append(self.unit("sent"))
+        self.users.append(self.unit("sent", PROMPT))
+        self.users.extend(self.unit(message_id, text) for message_id, text in self.also)
         if self.window:
             self.users = self.users[-self.window :]
 
@@ -622,26 +631,26 @@ class ContinuationFlowTests(unittest.TestCase):
         """confirm_sent_and_capture against a FakeThread, on a clock that steps 10 s per poll."""
         import itertools
 
-        base_user, base_ids = len(thread.users), thread.ids()
+        base_ids = thread.ids()
         clock = itertools.count(0, 10)
         with mock.patch.object(ask_core, "current_url", return_value=CONV), mock.patch.object(
             ask_core.time, "sleep", side_effect=lambda _s: thread.tick()
         ), mock.patch.object(ask_core.time, "monotonic", side_effect=lambda: next(clock)), mock.patch.object(
             ask_core, "log"
         ):
-            return ask_core.confirm_sent_and_capture(thread, base_user, base_ids, bound_url)
+            return ask_core.confirm_sent_and_capture(thread, base_ids, PROMPT, bound_url)
 
     def test_follow_up_is_confirmed_by_a_new_turn_id_while_the_count_stays_flat(self):
         """The 2026-09-27 regression: the prompt landed, but the long thread's page never showed
         more user turns than before, so a count-based check exited 1 after a successful send."""
         thread = FakeThread(5, send_after=2, window=5)
-        self.assertEqual(self.confirm(thread), CONV)
+        self.assertEqual(self.confirm(thread), (CONV, "sent"))
         self.assertEqual(len(thread.users), 5)
         thread.goto.assert_not_called()
 
     def test_follow_up_reloads_once_when_the_live_page_never_shows_the_turn(self):
         thread = FakeThread(5, send_after=None, on_reload=True)
-        self.assertEqual(self.confirm(thread), CONV)
+        self.assertEqual(self.confirm(thread), (CONV, "sent"))
         thread.goto.assert_called_once()
         self.assertEqual(thread.goto.call_args[0][0], CONV)
 
@@ -654,12 +663,32 @@ class ContinuationFlowTests(unittest.TestCase):
             self.confirm(thread)
         self.assertIn("no new user turn", str(caught.exception))
         thread.goto.assert_called_once()
-        self.assertEqual(self.confirm(FakeThread(0, send_after=None), bound_url=None), CONV)
+        # A fresh chat whose turn the live page misses is looked for once on its /c/<id> page.
+        thread = FakeThread(0, send_after=None, on_reload=True)
+        self.assertEqual(self.confirm(thread, bound_url=None), (CONV, "sent"))
+        self.assertEqual(thread.goto.call_args[0][0], CONV)
 
-    def test_turns_without_ids_fall_back_to_the_count(self):
-        self.assertEqual(self.confirm(FakeThread(1, send_after=1, with_ids=False)), CONV)
+    def test_another_runs_new_turn_is_never_taken_for_this_runs_turn(self):
+        """The 2026-09-28 race: a reload shows the other run's turn as new too (its id was not on
+        this page before the send). Only the turn carrying this run's prompt is this run's turn."""
+        thread = FakeThread(3, send_after=None, on_reload=True, also=[("a2-turn", OTHER_PROMPT)])
+        self.assertEqual(self.confirm(thread), (CONV, "sent"))
+        alone = FakeThread(3, send_after=1, also=[("a2-turn", OTHER_PROMPT)])
+        alone.land = lambda: alone.users.append(alone.unit("a2-turn", OTHER_PROMPT))
         with self.assertRaises(RuntimeError):
-            self.confirm(FakeThread(1, send_after=None, with_ids=False))
+            self.confirm(alone)
+
+    def test_turns_without_ids_are_never_taken_for_this_runs_turn(self):
+        """Without an id nothing ties the answer to this run's turn, so the run fails instead."""
+        with self.assertRaises(RuntimeError):
+            self.confirm(FakeThread(1, send_after=1, with_ids=False))
+
+    def test_the_turn_text_is_matched_on_letters_and_digits(self):
+        page = FakeThread(0, send_after=None)
+        page.users = [FakeUnit("u1", "report.pdf\nPDF\n# Round 1\n\n**Hi** there, `x_y`")]
+        self.assertEqual(ask_core.own_user_turn(page, set(), "# Round 1\n\nHi there, x_y"), "u1")
+        self.assertIsNone(ask_core.own_user_turn(page, {"u1"}, "# Round 1\n\nHi there, x_y"))
+        self.assertIsNone(ask_core.own_user_turn(page, set(), "Round 2"))
 
     def test_open_conversation_returns_the_url_the_page_settles_on(self):
         page = mock.Mock()
@@ -694,7 +723,7 @@ class ContinuationFlowTests(unittest.TestCase):
         page.query_selector.side_effect = lambda sel: mock.Mock() if streaming and sel == stop else None
         playwright = mock.MagicMock()
         clock = itertools.count(0, 1)
-        with mock.patch.object(ask_core, "sync_playwright", return_value=playwright), mock.patch.multiple(
+        with thread_state(), mock.patch.object(ask_core, "sync_playwright", return_value=playwright), mock.patch.multiple(
             ask_core,
             port_open=mock.Mock(return_value=True),
             cdp_browser_ok=mock.Mock(return_value=True),
@@ -726,6 +755,272 @@ class ContinuationFlowTests(unittest.TestCase):
     def test_follow_up_into_a_finished_conversation_goes_on_to_type(self):
         message, _, _ = self.follow_up(streaming=False)
         self.assertEqual(message, "reached typing")
+
+
+class FakeAnswer:
+    """An assistant unit: message ids, and its Markdown as the serializer would return it."""
+
+    def __init__(self, message_id, text):
+        self.message_id, self.text = message_id, text
+
+    def get_attribute(self, name):
+        return self.message_id if name == ask_core.MESSAGE_IDS_ATTR else None
+
+    def query_selector(self, _selector):
+        return None  # no separate Markdown root: the unit itself is serialized
+
+    def evaluate(self, _js):
+        return self.text
+
+
+class FakeExchange:
+    def __init__(self, answer=None, done=False):
+        self.answer, self.done = answer, done
+
+    def query_selector_all(self, selector):
+        return [self.answer] if self.answer and selector == ask_core.ASSISTANT_MSG_SELECTORS[0] else []
+
+    def evaluate(self, js):
+        assert js == ask_core.EXCHANGE_DONE_JS
+        return self.done
+
+
+class FakeConversation:
+    """A conversation page as the harvest sees it: exchange wrappers keyed by user-turn id, in page
+    order; `stray` user turns sit outside any wrapper."""
+
+    def __init__(self, exchanges, stray=()):
+        self.exchanges, self.stray = exchanges, set(stray)
+
+    def query_selector(self, selector):
+        import re
+
+        wrapper = re.fullmatch(r'\[data-turn-key="(.+)"\]', selector)
+        if wrapper:
+            return self.exchanges.get(wrapper.group(1))
+        unit = re.fullmatch(r'\[%s~="(.+)"\]' % ask_core.MESSAGE_IDS_ATTR, selector)
+        if unit and (unit.group(1) in self.exchanges or unit.group(1) in self.stray):
+            return object()
+        return None
+
+
+class HarvestBindingTests(unittest.TestCase):
+    """2026-09-28, run b2: queued behind a2's submit lock, b2 opened the conversation seconds after
+    a2's send, on a page that showed neither a2's turn nor the stop button. Its send forked a sibling
+    branch, a2's answer appeared on b2's page with ids b2 had never seen, and b2 returned it as its
+    own with rc 0."""
+
+    def harvest(self, page, *, on_tick=lambda n: None, wait=600):
+        import itertools
+
+        clock, ticks = [0.0], itertools.count(1)
+
+        def sleep(secs):
+            clock[0] += secs
+            on_tick(next(ticks))
+
+        with mock.patch.multiple(
+            ask_core,
+            current_url=mock.Mock(return_value=CONV),
+            is_streaming=mock.Mock(return_value=False),
+            raise_if_rate_limited=mock.Mock(),
+            detect_quota=mock.Mock(return_value=None),
+            log=mock.Mock(),
+        ), mock.patch.object(ask_core.time, "sleep", side_effect=sleep), mock.patch.object(
+            ask_core.time, "monotonic", side_effect=lambda: clock[0]
+        ):
+            return ask_core.wait_for_response(page, CONV, "b2-turn", wait)
+
+    def b2_page(self, own_done):
+        return FakeConversation(
+            {
+                "b-turn": FakeExchange(FakeAnswer("b-answer", "PONG-B"), done=True),
+                "b2-turn": FakeExchange(FakeAnswer("b2-answer", "PONG-B2"), done=own_done),
+                "a2-turn": FakeExchange(FakeAnswer("a2-answer", "1. one\n2. two"), done=True),
+            }
+        )
+
+    def test_only_this_runs_exchange_is_harvested(self):
+        """Another exchange's finished answer, fresh ids and all, is never taken, not even while
+        this run's own answer is still being written."""
+        page = self.b2_page(own_done=False)
+
+        def finish(tick):
+            if tick == 20:
+                page.exchanges["b2-turn"].done = True
+
+        self.assertEqual(self.harvest(page, on_tick=finish), ("PONG-B2", {"b2-answer"}))
+
+    def test_a_missing_own_turn_fails_the_harvest_instead_of_taking_another_answer(self):
+        page = self.b2_page(own_done=True)
+        del page.exchanges["b2-turn"]
+        with self.assertRaises(RuntimeError) as caught:
+            self.harvest(page)
+        self.assertIn("b2-turn is no longer on the page", str(caught.exception))
+
+    def test_own_turn_outside_an_exchange_wrapper_fails_at_once(self):
+        page = FakeConversation({"a2-turn": FakeExchange(FakeAnswer("a2-answer", "list"), done=True)}, stray={"b2-turn"})
+        with self.assertRaises(RuntimeError) as caught:
+            self.harvest(page)
+        self.assertIn("outside an exchange wrapper", str(caught.exception))
+
+    def verify(self, server, reply_ids=("b2-answer",)):
+        page = mock.Mock()
+        page.evaluate.side_effect = server if callable(server) else (lambda *_: server)
+        with mock.patch.object(ask_core.time, "sleep"):
+            ask_core.verify_reply_exchange(page, CONV, "b2-turn", set(reply_ids), PROMPT)
+        return page
+
+    @staticmethod
+    def server(turn=None, answer=None):
+        """The server's record of b2's turn and of the answer b2 read, as SERVER_MESSAGES_JS returns it."""
+        base_turn = {"role": "user", "status": "finished_successfully", "exchange": "x-b2", "text": PROMPT, "sibling_prompts": 0}
+        base_answer = {"role": "assistant", "status": "finished_successfully", "exchange": "x-b2", "text": "PONG-B2", "sibling_prompts": 0}
+        return {"b2-turn": {**base_turn, **(turn or {})}, "b2-answer": {**base_answer, **(answer or {})}}
+
+    def test_server_check_accepts_the_finished_answer_of_this_runs_exchange(self):
+        page = self.verify(self.server())
+        js, arg = page.evaluate.call_args[0]
+        self.assertEqual(js, ask_core.SERVER_MESSAGES_JS)
+        self.assertEqual(arg, {"cid": "6a9b8621-0250-83ee-93ed-50f50ee5d7bd", "ids": ["b2-turn", "b2-answer"]})
+
+    def test_server_check_refuses_every_shape_of_the_measured_race(self):
+        """Measured 2026-09-28 (b2, and again with the lock bypassed): b2's prompt forked a sibling of
+        a2's turn, a2's answer streamed into b2's wrapper under a2's exchange id and was left
+        'in_progress' on the server; a2 itself saw its own answer under its own exchange id, but the
+        server had filed b2's final text there."""
+        shapes = {
+            "another prompt's exchange": self.server(answer={"exchange": "x-a2"}),
+            "sibling branch": self.server(turn={"sibling_prompts": 1}),
+            "not this run's prompt": self.server(turn={"text": OTHER_PROMPT}),
+            "another prompt's exchange ": self.server(turn={"exchange": None}, answer={"exchange": None}),
+        }
+        for expected, server in shapes.items():
+            with self.assertRaises(ask_core.ForeignReplyError, msg=expected) as caught:
+                self.verify(server)
+            self.assertIn(expected.strip(), str(caught.exception))
+        with self.assertRaises(RuntimeError) as caught:
+            self.verify(self.server(answer={"status": "in_progress", "text": ""}))
+        self.assertIn("not finished on the server: b2-answer", str(caught.exception))
+
+    def test_server_check_waits_for_a_late_record_but_fails_loudly_when_it_cannot_run(self):
+        late = iter([self.server(answer={"status": "in_progress"}), {"b2-turn": self.server()["b2-turn"]}, self.server()])
+        self.verify(lambda *_: next(late))
+        for server in (
+            {"error": "HTTP 401"},
+            {"b2-turn": self.server()["b2-turn"], "b2-answer": None},
+            mock.Mock(side_effect=RuntimeError("Target page has been closed")),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                self.verify(server)
+            self.assertIn("could not confirm the reply", str(caught.exception))
+        with self.assertRaises(RuntimeError):
+            self.verify({}, reply_ids=())
+
+    def test_a_foreign_reply_is_exit_1_with_nothing_printed(self):
+        def foreign(*_args, **_kwargs):
+            raise ask_core.ForeignReplyError("the answer shown under this run's prompt belongs to another prompt's exchange")
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "answer.md"
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = ask_core.main(["--out", str(output), "hello"], stdin=io.StringIO(), ask_fn=foreign)
+            self.assertEqual((code, stdout.getvalue()), (1, ""))
+            self.assertIn("another prompt's exchange", stderr.getvalue())
+            self.assertFalse(output.exists())
+
+
+class ConversationLockTests(unittest.TestCase):
+    def free(self, url=CONV):
+        fd = ask_core.lock_conversation(url)
+        if fd is None:
+            return False
+        ask_core.unlock_conversation(fd)
+        return True
+
+    def test_a_second_follow_up_is_refused_before_anything_opens(self):
+        with thread_state():
+            fd = ask_core.lock_conversation(CONV)
+            try:
+                with mock.patch.object(ask_core, "sync_playwright") as playwright, mock.patch.object(
+                    ask_core, "port_open"
+                ) as port_open:
+                    with self.assertRaises(RuntimeError) as caught:
+                        ask_core.ask("hi", effort="pro", attach=None, max_wait=60, conversation=CONV)
+                self.assertTrue(str(caught.exception).startswith(ask_core.CONVERSATION_BUSY))
+                self.assertIn(f"pid={os.getpid()}", str(caught.exception))
+                playwright.assert_not_called()
+                port_open.assert_not_called()
+            finally:
+                ask_core.unlock_conversation(fd)
+            self.assertTrue(self.free())
+
+    def test_the_lock_is_released_on_success_failure_and_exceptions(self):
+        other = "https://chatgpt.com/c/0c4b4501-1111-4222-8333-444455556666"
+        outcomes = [
+            mock.Mock(return_value=ask_core.Reply("answer", CONV)),
+            mock.Mock(side_effect=ask_core.ResponseTimeoutError("timed out")),
+            mock.Mock(side_effect=KeyboardInterrupt),
+        ]
+        with thread_state():
+            for inner in outcomes:
+                with mock.patch.object(ask_core, "_ask", inner):
+                    try:
+                        ask_core.ask("hi", effort="pro", attach=None, max_wait=60, conversation=CONV)
+                    except (ask_core.ResponseTimeoutError, KeyboardInterrupt):
+                        pass
+                self.assertTrue(self.free(), inner)
+
+            def fresh_chat_then_crash(*_args, held, **_kwargs):
+                held.append(ask_core.lock_conversation(other))
+                self.assertFalse(self.free(other))
+                raise RuntimeError("page crashed")
+
+            with mock.patch.object(ask_core, "_ask", fresh_chat_then_crash):
+                with self.assertRaises(RuntimeError):
+                    ask_core.ask("hi", effort="pro", attach=None, max_wait=60, project="p")
+            self.assertTrue(self.free(other))
+
+    def test_a_fresh_chat_is_locked_before_the_submit_lock_is_released(self):
+        seen = {}
+
+        def release_submit_lock():
+            seen["free at release"] = self.free()
+            with self.assertRaises(RuntimeError) as caught:  # a --continue queued behind the submit lock
+                ask_core.ask("next", effort="pro", attach=None, max_wait=60, conversation=CONV)
+            seen["queued follow-up"] = str(caught.exception)
+
+        page = mock.Mock()
+        playwright = mock.MagicMock()
+        with thread_state(), mock.patch.object(ask_core, "sync_playwright", return_value=playwright), mock.patch.multiple(
+            ask_core,
+            port_open=mock.Mock(return_value=True),
+            cdp_browser_ok=mock.Mock(return_value=True),
+            ensure_page_target=mock.Mock(),
+            pick_context=mock.Mock(return_value=mock.Mock(new_page=mock.Mock(return_value=page))),
+            _guard_dialogs=mock.Mock(),
+            login_state=mock.Mock(return_value="ok"),
+            raise_if_rate_limited=mock.Mock(),
+            enter_project=mock.Mock(return_value=True),
+            select_model=mock.Mock(),
+            message_ids=mock.Mock(return_value=set()),
+            put_text=mock.Mock(),
+            composer_has_prompt=mock.Mock(return_value=True),
+            click_send=mock.Mock(),
+            confirm_sent_and_capture=mock.Mock(return_value=(CONV, "u1")),
+            record_thread=mock.Mock(),
+            release_submit_lock=release_submit_lock,
+            wait_for_response=mock.Mock(return_value=("answer", {"a1"})),
+            verify_reply_exchange=mock.Mock(),
+            current_url=mock.Mock(return_value=CONV),
+            log=mock.Mock(),
+        ):
+            reply = ask_core.ask("hi", effort="pro", attach=None, max_wait=60, project="p")
+            self.assertEqual(reply, ask_core.Reply("answer", CONV))
+            self.assertTrue(self.free())
+        self.assertEqual(seen["free at release"], False)
+        self.assertTrue(seen["queued follow-up"].startswith(ask_core.CONVERSATION_BUSY))
 
 
 @contextlib.contextmanager

@@ -36,7 +36,8 @@ CHATGPT_URL = "https://chatgpt.com/"
 # since 2026-09-28, 'turn-0:…' before; ids in data-chatgpt-search-message-ids) and, once the answer
 # is done, the assistant's .turn-action-controls bar. The page loads only the newest turns of a long
 # thread, so turns are told apart by id, not by position or count. Pre-2026-09 selectors stay listed
-# after the current ones; the first selector that matches wins.
+# after the current ones; the first selector that matches wins. A run harvests only its own exchange:
+# the [data-turn-key] wrapper keyed by its own user turn's id (see own_exchange).
 COMPOSER_FORM_SELECTOR = "form[data-chatgpt-composer]"
 INPUT_SELECTORS = [
     f'{COMPOSER_FORM_SELECTOR} [contenteditable="true"][role="textbox"]',
@@ -56,6 +57,14 @@ ASSISTANT_MSG_SELECTORS = [
     'article[data-turn="assistant"]',
 ]
 MESSAGE_IDS_ATTR = "data-chatgpt-search-message-ids"  # space-separated; was data-message-id
+# Measured 2026-09-28 on 13 exchanges of two scratch threads: the wrapper's data-turn-key equals its
+# user unit's message id, and it holds that user unit, exactly one assistant unit and the assistant's
+# action bar (outside both units).
+EXCHANGE_KEY_ATTR = "data-turn-key"
+MESSAGE_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")
+# A run's own user turn must carry the start of its prompt, compared on letters and digits only (the
+# bubble may render Markdown or show an attachment chip before the text).
+PROMPT_KEY_CHARS = 48
 ASSISTANT_MARKDOWN_SELECTORS = ['[data-markdown-text-style="assistant-message"]', ".markdown"]
 TURN_ACTIONS_SELECTOR = ".turn-action-controls"
 # The assistant bar's copy action (measured 복사); the user unit's own bar labels its copy 메시지 복사.
@@ -131,6 +140,8 @@ CONV_URL_RE = re.compile(r"/c/[0-9a-f]{8}[0-9a-f-]{4,}", re.I)
 THREAD_HANDLE_RE = re.compile(r"^[0-9a-f]{8}[0-9a-f-]*$", re.I)
 THREAD_LEDGER_CAP = 500
 STABLE_SECS = 4
+# How long the harvest tolerates the run's own turn missing from the page before it gives up on it.
+OWN_TURN_GRACE_SECS = 30
 STATUS_INTERVAL = 15
 # Project grouping (ported from insane-review's pack_and_ask.py). The /g/g-p- URL mark and
 # the sidebar/aria heuristics below are the early 2026-08 ChatGPT DOM — revalidate on drift.
@@ -160,6 +171,10 @@ class SentUnknownLocationError(Exception):
 
 class RateLimitedError(Exception):
     pass
+
+
+class ForeignReplyError(Exception):
+    """The answer shown under this run's prompt is not that prompt's answer."""
 
 
 class Reply(NamedTuple):
@@ -407,6 +422,51 @@ def thread_trailer(url: str) -> str:
     )
 
 
+# --- conversation lock -----------------------------------------------------------------
+# One bridge run per conversation on this machine. Measured 2026-09-28: a follow-up that opened the
+# conversation within ~5-10 s of another run's send saw neither that turn nor the stop button, so its
+# send forked a sibling branch and the server mixed the two exchanges (it returned the other run's
+# answer). The wrapper's submit lock is released ~5 s after a send, so the conversation needs a lock
+# of its own that lasts until the reply is harvested. flock is dropped by the kernel when the process
+# dies; the small lock files stay (deleting a flock file races with the next opener).
+
+CONVERSATION_BUSY = "another bridge run is waiting for a reply in this conversation; nothing sent"
+
+
+def conversation_lock_path(conversation_url: str) -> Path:
+    cid = conversation_id(conversation_url)
+    if not cid:
+        raise ValueError(f"no conversation id in {conversation_url!r}")
+    return state_dir() / "conversations" / f"{cid.lower()}.lock"
+
+
+def lock_conversation(conversation_url: str) -> int | None:
+    """Take this conversation's lock without waiting: the held fd, or None when another run has it."""
+    path = conversation_lock_path(conversation_url)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    os.ftruncate(fd, 0)
+    os.write(fd, f"pid={os.getpid()} since={datetime.now().astimezone().isoformat(timespec='seconds')}\n".encode())
+    return fd
+
+
+def conversation_lock_holder(conversation_url: str) -> str:
+    try:
+        return conversation_lock_path(conversation_url).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def unlock_conversation(fd: int) -> None:
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
+
 def atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -438,25 +498,6 @@ def _qa(page, selectors):
 
 def normalize(text: str | None) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
-
-
-def count_nodes_strict(page, selectors) -> int:
-    last_error = None
-    for _ in range(3):
-        clean_zero = True
-        for selector in selectors:
-            try:
-                nodes = page.query_selector_all(selector)
-            except Exception as exc:
-                clean_zero = False
-                last_error = exc
-                continue
-            if nodes:
-                return len(nodes)
-        if clean_zero:
-            return 0
-        time.sleep(0.3)
-    raise RuntimeError(f"could not snapshot message counts: {last_error}")
 
 
 MESSAGE_IDS_JS = """els => els.flatMap(e =>
@@ -1195,60 +1236,70 @@ def release_submit_lock() -> None:
     log("submit lock released")
 
 
-def new_user_turn(page, base_user: int, base_ids: set[str]) -> bool:
-    """True once the last user turn on the page is one it did not show before the send. Judged by
-    message id: from 2026-09-27 follow-ups in a long agentic thread landed while the page's user-turn
-    count stayed flat (that page shows only its newest turns, fetched with `num_turns=10`), so a
-    count is no proof either way. Turns without ids (pre-2026-09 DOM) fall back to the count."""
-    nodes = _qa(page, USER_MSG_SELECTORS)
-    if not nodes:
-        return False
-    try:
-        ids = node_message_ids(nodes[-1])
-    except Exception:
-        return False
-    if ids:
-        return not ids <= base_ids
-    return len(nodes) > base_user
+def text_key(text: str | None) -> str:
+    """Letters and digits only, casefolded: the same for a prompt and its rendered bubble."""
+    return re.sub(r"[\W_]+", "", text or "").casefold()
 
 
-def _poll(check: Callable[[], bool], secs: float) -> bool:
+def own_user_turn(page, base_ids: set[str], prompt: str) -> str | None:
+    """The message id of the user turn this run sent: a user unit the page did not show before the
+    send (by id: a long thread's page shows only its newest turns, fetched with `num_turns=10`, so a
+    count proves nothing) whose text carries the start of this run's prompt. Another run's turn that
+    shows up on this page is new too, hence the text check. None until such a turn is on the page;
+    two such turns cannot be told apart, which fails the run."""
+    key = text_key(prompt)[:PROMPT_KEY_CHARS]
+    found = []
+    for node in _qa(page, USER_MSG_SELECTORS):
+        try:
+            fresh = node_message_ids(node) - base_ids
+            if fresh and key in text_key(node.inner_text()):
+                found.append(fresh)
+        except Exception:
+            continue
+    if not found:
+        return None
+    if len(found) > 1 or len(found[0]) > 1:
+        raise RuntimeError("more than one new user turn carries this prompt; cannot tell which one this run sent")
+    return next(iter(found[0]))
+
+
+def _poll(check: Callable[[], object], secs: float):
+    """The first truthy value `check` returns within `secs`, else None."""
     deadline = time.monotonic() + secs
     while time.monotonic() < deadline:
-        if check():
-            return True
+        value = check()
+        if value:
+            return value
         time.sleep(1)
-    return False
+    return None
 
 
 def confirm_sent_and_capture(
-    page, base_user: int, base_ids: set[str], bound_url: str | None = None
-) -> str:
-    """Wait for the send to register, then return the conversation URL. In a fresh chat the URL
-    flipping to /c/<id> is as good as a new user turn; when following up (bound_url) the page
-    already carries that URL, so only a new user turn counts. A follow-up whose turn the live page
-    never shows gets one reload of the conversation, and the turn must then be there."""
-
-    def sent() -> bool:
-        if new_user_turn(page, base_user, base_ids):
-            return True
-        return bound_url is None and CONV_URL_RE.search(current_url(page)) is not None
-
-    if not _poll(sent, 45):
-        if bound_url is None:
+    page, base_ids: set[str], prompt: str, bound_url: str | None = None
+) -> tuple[str, str]:
+    """Wait for this run's user turn (own_user_turn), then return the conversation URL and the turn's
+    message id, which binds the harvest to this run's own exchange. A turn the live page never shows
+    gets one reload of the conversation (the bound one, or the /c/<id> a fresh chat has flipped to),
+    and the turn must then be there. The URL alone proves nothing: a follow-up page carries it from
+    the start."""
+    turn_id = _poll(lambda: own_user_turn(page, base_ids, prompt), 45)
+    if turn_id is None:
+        url = bound_url or (current_url(page) if CONV_URL_RE.search(current_url(page)) else None)
+        if url is None:
             raise RuntimeError("no new user turn appeared after send")
         log("no new user turn on the live page; reloading the conversation to look for it")
-        page.goto(bound_url, wait_until="domcontentloaded", timeout=60000)
-        if not _poll(sent, 30):
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        turn_id = _poll(lambda: own_user_turn(page, base_ids, prompt), 30)
+        if turn_id is None:
             raise RuntimeError("no new user turn appeared after send (nor after reloading the conversation)")
         log("new user turn found after reload")
     if bound_url is not None:
-        return bound_url
+        return bound_url, turn_id
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
         url = current_url(page)
         if CONV_URL_RE.search(url):
-            return url
+            return url, turn_id
         time.sleep(1)
     raise SentUnknownLocationError("prompt was sent but the conversation URL was not captured")
 
@@ -1266,7 +1317,7 @@ def reply_in_progress(page, secs: float = REPLY_IN_PROGRESS_POLL_SECS) -> bool:
     (2 of 2, 30 s each). The short poll is margin for a slower load. Blind spot: a tab that loads
     the conversation within ~5-10 s of another tab's send shows neither that turn nor the stop
     button, and never catches up without a reload."""
-    return _poll(lambda: is_streaming(page), secs)
+    return bool(_poll(lambda: is_streaming(page), secs))
 
 
 def detect_quota(page) -> str | None:
@@ -1283,19 +1334,6 @@ def detect_quota(page) -> str | None:
         if any(hint.casefold() in lowered for hint in QUOTA_HINTS):
             return text[:200]
     return None
-
-
-def fresh_assistant_node(page, base_ids: set[str], base_assistant: int):
-    nodes = _qa(page, ASSISTANT_MSG_SELECTORS)
-    fresh = []
-    for index, node in enumerate(nodes):
-        try:
-            ids = node_message_ids(node)
-        except Exception:
-            continue
-        if (ids and not ids <= base_ids) or (not ids and index >= base_assistant):
-            fresh.append(node)
-    return fresh[-1] if fresh else None
 
 
 MARKDOWN_SERIALIZER = r"""
@@ -1367,39 +1405,41 @@ def assistant_markdown(node) -> str:
             return ""
 
 
-# Climb from the assistant message to its own exchange wrapper: the first ancestor that holds an
-# assistant action bar (the user message carries a bar of its own inside its unit; that one does
-# not count). Should that ancestor hold other assistant messages too, the bar belongs to an earlier
-# exchange. The turn is done once its bar carries the copy action.
-TURN_HAS_COPY_JS = """el => {
-  const copy = %s, bar = %s, user = %s, assistant = %s;
-  let node = el;
-  for (let hop = 0; hop < 8 && node; hop++) {
-    const bars = [...node.querySelectorAll(bar)].filter(b => !b.closest(user));
-    if (bars.length)
-      return node.querySelectorAll(assistant).length <= 1 && bars.some(b => b.querySelector(copy));
-    node = node.parentElement;
-  }
-  return false;
-}""" % tuple(
+def own_exchange(page, turn_id: str):
+    """This run's exchange wrapper: [data-turn-key] keyed by its own user turn's id. Nothing outside
+    it is ever harvested."""
+    if not MESSAGE_ID_RE.match(turn_id):
+        raise RuntimeError(f"unexpected message id {turn_id!r}")
+    return page.query_selector(f'[{EXCHANGE_KEY_ATTR}="{turn_id}"]')
+
+
+def exchange_answer(exchange):
+    """The exchange's assistant unit (the last one, should there ever be more), or None."""
+    nodes = _qa(exchange, ASSISTANT_MSG_SELECTORS)
+    return nodes[-1] if nodes else None
+
+
+def user_turn_on_page(page, turn_id: str) -> bool:
+    return page.query_selector(f'[{MESSAGE_IDS_ATTR}~="{turn_id}"]') is not None
+
+
+# The exchange is done once its assistant action bar (not the user unit's own bar, whose copy is
+# labelled 메시지 복사) carries the copy action.
+EXCHANGE_DONE_JS = """w => [...w.querySelectorAll(%s)]
+  .filter(bar => !bar.closest(%s))
+  .some(bar => bar.querySelector(%s) !== null)""" % tuple(
     json.dumps(value)
-    for value in (
-        ", ".join(COPY_BTN_SELECTORS),
-        TURN_ACTIONS_SELECTOR,
-        ", ".join(USER_MSG_SELECTORS),
-        ", ".join(ASSISTANT_MSG_SELECTORS),
-    )
+    for value in (TURN_ACTIONS_SELECTOR, ", ".join(USER_MSG_SELECTORS), ", ".join(COPY_BTN_SELECTORS))
 )
 
 
-def turn_complete(page, node) -> bool:
-    """The fresh assistant turn is done once nothing streams and its own turn carries the copy
-    action. A page-wide copy count would be satisfied too early: earlier turns keep their
-    buttons (a follow-up inherits all of them) and the user's own turn carries one as well."""
+def exchange_complete(page, exchange) -> bool:
+    """Nothing streams and this exchange's own assistant bar shows the copy action. Earlier
+    exchanges keep their bars, so nothing outside the exchange counts."""
     if is_streaming(page):
         return False
     try:
-        return bool(node.evaluate(TURN_HAS_COPY_JS))
+        return bool(exchange.evaluate(EXCHANGE_DONE_JS))
     except Exception:
         return False
 
@@ -1407,12 +1447,15 @@ def turn_complete(page, node) -> bool:
 def wait_for_response(
     page,
     conversation_url: str,
-    base_ids: set[str],
-    base_assistant: int,
+    turn_id: str,
     deadline: float,
-) -> str:
+) -> tuple[str, set[str]]:
+    """The finished answer of this run's own exchange (see own_exchange) and the assistant message ids
+    it was read from. A turn that stays off the page for OWN_TURN_GRACE_SECS fails the harvest: some
+    other exchange's answer is never a substitute."""
     key = conversation_key(conversation_url)
     stable_since = None
+    missing_since = None
     previous = ""
     last_status = -STATUS_INTERVAL
     log(f"waiting for response (up to {max(0, int(deadline - time.monotonic()))}s)")
@@ -1428,8 +1471,17 @@ def wait_for_response(
             status = "generating" if is_streaming(page) else "checking completion"
             log(f"response {status}; {remaining}s remaining")
             last_status = remaining // STATUS_INTERVAL
-        node = fresh_assistant_node(page, base_ids, base_assistant)
-        if node is None or not turn_complete(page, node):
+        exchange = own_exchange(page, turn_id)
+        if exchange is None:
+            if user_turn_on_page(page, turn_id):
+                raise RuntimeError(f"this run's turn {turn_id} is on the page outside an exchange wrapper")
+            missing_since = missing_since or time.monotonic()
+            if time.monotonic() - missing_since >= OWN_TURN_GRACE_SECS:
+                raise RuntimeError(f"this run's turn {turn_id} is no longer on the page")
+        else:
+            missing_since = None
+        node = exchange_answer(exchange) if exchange is not None else None
+        if node is None or not exchange_complete(page, exchange):
             # The prompt is already in flight here: a throttle now blocks only the
             # harvest, so the error must carry the conversation URL for a later pickup.
             raise_if_rate_limited(
@@ -1454,9 +1506,95 @@ def wait_for_response(
             continue
         if stable_since is not None and time.monotonic() - stable_since >= STABLE_SECS:
             log(f"response received: {len(current)} characters")
-            return current
+            return current, node_message_ids(node)
         time.sleep(1)
     raise ResponseTimeoutError("response wait timed out")
+
+
+# The server's record of the given messages: role, status, turn_exchange_id (every message of one
+# exchange carries its user turn's value; measured 2026-09-28 on 45 messages of two scratch threads),
+# the text, and for a user message the other user messages that reply to the same parent. Read with
+# the page's own session token from the endpoint the page itself calls.
+SERVER_MESSAGES_JS = """async ({cid, ids}) => {
+  const session = await (await fetch('/api/auth/session')).json();
+  const response = await fetch('/backend-api/conversation/' + cid,
+    {headers: {Authorization: 'Bearer ' + session.accessToken}});
+  if (!response.ok) return {error: 'HTTP ' + response.status};
+  const mapping = (await response.json()).mapping || {};
+  const role = id => mapping[id] && mapping[id].message && mapping[id].message.author.role;
+  const out = {};
+  for (const id of ids) {
+    const node = mapping[id], message = node && node.message;
+    const parent = node && mapping[node.parent];
+    out[id] = message ? {
+      role: role(id),
+      status: message.status || null,
+      exchange: (message.metadata || {}).turn_exchange_id || null,
+      text: ((message.content || {}).parts || []).filter(part => typeof part === 'string').join('\\n'),
+      sibling_prompts: parent ? parent.children.filter(c => c !== id && role(c) === 'user').length : 0,
+    } : null;
+  }
+  return out;
+}"""
+SERVER_CHECK_TRIES = 5
+
+
+def verify_reply_exchange(page, conversation_url: str, turn_id: str, reply_ids: set[str], prompt: str) -> None:
+    """Refuse an answer the server does not file as this run's own. The page ties the answer to this
+    run's turn, but measured 2026-09-28 (two races on a scratch thread) that is not enough: a prompt
+    sent from a page that did not yet show another run's fresh turn replies to the same message as
+    that turn (a sibling branch), both generations run at once, and the server mixes them — the
+    other run's answer streamed into this run's wrapper, the server filed one run's final text under
+    the other's exchange, and the answer that streamed was left 'in_progress' with no text. So the
+    answer must come from this run's exchange (turn_exchange_id), be finished there, and this run's
+    turn must have no sibling prompt."""
+    if not reply_ids:
+        raise RuntimeError(f"the reply carries no message id, so it cannot be checked against this run's turn; see {conversation_url}")
+    ids = [turn_id, *sorted(reply_ids)]
+    problem = ""
+    for attempt in range(SERVER_CHECK_TRIES):
+        if attempt:
+            time.sleep(3)
+        try:
+            found = page.evaluate(SERVER_MESSAGES_JS, {"cid": conversation_id(conversation_url), "ids": ids}) or {}
+        except Exception as exc:
+            problem = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+            continue
+        missing = [message_id for message_id in ids if not found.get(message_id)]
+        if found.get("error") or missing:
+            problem = found.get("error") or f"not on the server yet: {', '.join(missing)}"
+            continue
+        _refuse_foreign(found, turn_id, sorted(reply_ids), prompt, conversation_url)
+        unfinished = [message_id for message_id in ids if found[message_id]["status"] != "finished_successfully"]
+        if not unfinished:
+            return
+        problem = f"not finished on the server: {', '.join(unfinished)}"
+    raise RuntimeError(
+        f"could not confirm the reply as this run's own on the server ({problem}); "
+        f"nothing returned — read it at {conversation_url}"
+    )
+
+
+def _refuse_foreign(found: dict, turn_id: str, reply_ids: list[str], prompt: str, conversation_url: str) -> None:
+    user = found[turn_id]
+    if user["role"] != "user" or text_key(prompt)[:PROMPT_KEY_CHARS] not in text_key(user["text"]):
+        raise ForeignReplyError(f"the server's message {turn_id} is not this run's prompt; see {conversation_url}")
+    if user["sibling_prompts"]:
+        raise ForeignReplyError(
+            "another prompt was sent in reply to the same message as this run's (a sibling branch), and the "
+            f"server mixes such answers; nothing returned — see {conversation_url}"
+        )
+    exchange = user["exchange"]
+    foreign = [
+        message_id
+        for message_id in reply_ids
+        if found[message_id]["role"] != "assistant" or not exchange or found[message_id]["exchange"] != exchange
+    ]
+    if foreign:
+        raise ForeignReplyError(
+            "the answer shown under this run's prompt belongs to another prompt's exchange "
+            f"(messages {', '.join(foreign)}); nothing returned — see {conversation_url}"
+        )
 
 
 def ask(
@@ -1467,6 +1605,36 @@ def ask(
     max_wait: int,
     project: str | None = None,
     conversation: str | None = None,
+) -> Reply:
+    """One prompt, one reply. The conversation lock (lock_conversation) is held from before anything
+    is typed — a follow-up takes it up front, a fresh chat as soon as its URL is known and before the
+    submit lock is released — until the reply is harvested or the run gives up."""
+    held: list[int] = []
+    if conversation:
+        fd = lock_conversation(conversation)
+        if fd is None:
+            holder = conversation_lock_holder(conversation)
+            raise RuntimeError(CONVERSATION_BUSY + (f" (held by {holder})" if holder else ""))
+        held.append(fd)
+    try:
+        return _ask(
+            prompt, effort=effort, attach=attach, max_wait=max_wait, project=project,
+            conversation=conversation, held=held,
+        )
+    finally:
+        for fd in held:
+            unlock_conversation(fd)
+
+
+def _ask(
+    prompt: str,
+    *,
+    effort: str,
+    attach: Path | None,
+    max_wait: int,
+    project: str | None,
+    conversation: str | None,
+    held: list[int],
 ) -> Reply:
     if sync_playwright is None:
         raise RuntimeError(
@@ -1515,8 +1683,6 @@ def ask(
             if attach is not None:
                 attach_file(page, attach)
 
-            base_user = count_nodes_strict(page, USER_MSG_SELECTORS)
-            base_assistant = count_nodes_strict(page, ASSISTANT_MSG_SELECTORS)
             base_ids = message_ids(page)
 
             put_text(page, prompt)
@@ -1527,8 +1693,13 @@ def ask(
                     raise RuntimeError("prompt did not enter the composer intact")
             raise_if_rate_limited(page, "rate limited before submit; nothing sent")
             click_send(page)
-            conversation_url = confirm_sent_and_capture(page, base_user, base_ids, bound_url)
-            log(f"thread bound: {thread_handle(conversation_id(conversation_url))} ({conversation_url})")
+            conversation_url, turn_id = confirm_sent_and_capture(page, base_ids, prompt, bound_url)
+            log(f"thread bound: {thread_handle(conversation_id(conversation_url))} ({conversation_url}); turn {turn_id}")
+            if not held:  # a fresh chat: locked before the submit lock lets a --continue in
+                fd = lock_conversation(conversation_url)
+                if fd is None:
+                    raise RuntimeError(f"the new conversation is already locked by another run; see {conversation_url}")
+                held.append(fd)
             try:
                 record_thread(conversation_url, prompt)
             except Exception as exc:  # bookkeeping — the reply, not the ledger, is the deliverable
@@ -1538,14 +1709,8 @@ def ask(
 
             for attempt in range(2):
                 try:
-                    body = wait_for_response(
-                        page,
-                        conversation_url,
-                        base_ids,
-                        base_assistant,
-                        deadline,
-                    )
-                    return Reply(body, conversation_url)
+                    body, reply_ids = wait_for_response(page, conversation_url, turn_id, deadline)
+                    break
                 except (ResponseTimeoutError, RateLimitedError):
                     raise  # neither gets better by reloading the page right away
                 except Exception as exc:
@@ -1560,7 +1725,9 @@ def ask(
                     _guard_dialogs(context, page)
                     page.goto(conversation_url, wait_until="domcontentloaded", timeout=60000)
                     time.sleep(2)
-            raise RuntimeError("unreachable harvest state")
+            verify_reply_exchange(page, conversation_url, turn_id, reply_ids, prompt)
+            log(f"reply checked on the server: {', '.join(sorted(reply_ids))} answer turn {turn_id}")
+            return Reply(body, conversation_url)
         finally:
             try:
                 page.close()

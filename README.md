@@ -67,6 +67,19 @@ chatgpt --resume 6a9b8621 "follow-up question"   # a specific thread, by its han
   reported before anything is typed (exit 1), and so is a thread whose previous
   reply is still being generated: a prompt sent then would join that reply
   instead of starting a new turn.
+- One run per thread on this machine: a run holds a lock on its conversation
+  (`~/.chatgpt/conversations/<id>.lock`) from before it types until its reply is
+  harvested or it gives up; a fresh chat takes it as soon as the new thread
+  exists. A follow-up into a thread whose lock is held exits 1 at once with
+  "another bridge run is waiting for a reply in this conversation; nothing
+  sent" — nothing is opened or typed, and it does not wait.
+- The reply printed is always the answer to this run's own prompt: the run finds
+  its own turn by message id and prompt text, reads only that exchange, and
+  before printing checks with ChatGPT's server that the answer belongs to that
+  exchange. When the answer cannot be found or belongs to another prompt (two
+  prompts sent into one thread seconds apart, e.g. from another machine or by
+  hand, can get their answers mixed), the run exits 1 with the thread URL and
+  prints nothing.
 - Up to a few runs execute concurrently; excess waits on a lock for up to
   `CHATGPT_LOCK_WAIT` seconds (default 3600).
 - `--effort` takes one of the five slider positions `instant`, `medium`,
