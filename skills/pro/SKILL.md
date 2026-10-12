@@ -1,6 +1,6 @@
 ---
-name: chatgpt
-description: Delegate ultra-hard analysis/design/research/verification tasks (tens of minutes+) to subscription ChatGPT Pro (GPT-6 Pro — Chat mode, Latest model at Pro effort, verified before sending). Just pass a prompt — no packing or templates; ask for authenticated connectors (GitHub etc.) directly in the prompt.
+name: pro
+description: Delegate ultra-hard analysis/design/research/verification tasks (tens of minutes+) to subscription ChatGPT Pro (GPT-6 Pro — Chat mode, the GPT-6 entry at Pro effort, verified before sending). Just pass a prompt — no packing or templates; ask for authenticated connectors (GitHub etc.) directly in the prompt.
 ---
 
 The plugin's `bin/` is on PATH — call `chatgpt` directly. If it fails on a
@@ -19,12 +19,14 @@ echo "your question" | chatgpt -
 Long-running by nature — invoke with `run_in_background`. Up to a few runs
 execute concurrently; excess waits on a lock. stdout is the response body
 followed by a `Thread <handle> · <url>` trailer (see Follow-ups).
-The model is fixed (Chat mode · Latest · Pro, shown as `6 Pro`); `--effort
-instant|medium|high|extra high` lowers the reasoning effort when a Pro-length
-wait is not warranted. Exit codes: 0 = success,
+The model is fixed (Chat mode · the GPT-6 entry checked in the model list,
+its row reading `Pro` at the top effort); a list without a GPT-6 entry fails
+closed. `--effort instant|medium|high|extra high` lowers the reasoning effort
+when a Pro-length wait is not warranted. Exit codes: 0 = success,
 2 = model verification failed (nothing sent), 3 = response timeout,
 4 = lock timeout, 5 = ChatGPT rate limit (if the prompt was already sent, the
 error carries the conversation URL for a later manual pickup).
+Image generation is a separate skill, `chatgpt:image-gen` (`chatgpt --image`).
 
 Chats are grouped under a per-folder ChatGPT project named `<folder> · <hash8>`
 (hash of the cwd, so same-named folders stay separate) instead of piling up in

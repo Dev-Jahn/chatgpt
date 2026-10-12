@@ -1,18 +1,24 @@
 # chatgpt
 
 A neutral Claude Code plugin that forwards a prompt to a logged-in subscription
-ChatGPT Pro browser session and returns the response as Markdown. No review
-framing, no templates, no repomix packing, no connector manipulation — just a
-bridge. The composer is driven in **Chat** mode with the **Latest** model
-(`최신`) at **Pro** reasoning effort, and the run is fail-closed: the model row
-of the opened model menu must read exactly `6 Pro` (GPT-6 Pro, as of 2026-09;
-the closed pill shows only `Pro`) with Latest selected before anything is sent,
-otherwise the run stops with exit 2. A composer left in Work mode or on an
-explicit model is switched back first; Work mode's top tier (Ultra, a
+ChatGPT Pro browser session and returns the response as Markdown — or, with
+`--image`, the images ChatGPT's image tool generates. No review framing, no
+templates, no repomix packing, no connector manipulation — just a bridge. The
+composer is driven in **Chat** mode with the **GPT-6** model at **Pro**
+reasoning effort, and the run is fail-closed: GPT-6 must be the checked entry
+of the opened model menu's model list (the entry name carries the version) and
+the menu's model row must read exactly `Pro` at the maximum-effort tick before
+anything is sent, otherwise the run stops with exit 2. A model list without a
+GPT-6 entry fails closed the same way. A composer left in Work mode or on
+another model is switched back first; Work mode's top tier (Ultra, a
 multi-turn agentic mode) is deliberately not used.
 
-Intended use: offloading ultra-hard analysis / design / research / verification
-tasks that take tens of minutes or more of Pro-tier reasoning.
+Two skills ship with it:
+
+- `chatgpt:pro` — offloading ultra-hard analysis / design / research /
+  verification tasks that take tens of minutes or more of Pro-tier reasoning.
+- `chatgpt:image-gen` — generating or editing images (`chatgpt --image`,
+  effort `medium` unless `--effort` says otherwise).
 
 ## Install
 
@@ -49,6 +55,8 @@ echo "your question" | chatgpt -
 chatgpt --effort pro --attach context.pdf --max-wait 7200 --out answer.md "question"
 chatgpt --continue "follow-up question"          # most recent thread from this folder
 chatgpt --resume 6a9b8621 "follow-up question"   # a specific thread, by its handle
+chatgpt --image "a watercolor fox reading a newspaper"           # effort medium
+chatgpt --image --effort high --attach ref.png --out fox.png "restyle this as a woodcut"
 ```
 
 - stdout carries the response body, then a blank line and a short trailer
@@ -96,11 +104,29 @@ chatgpt --resume 6a9b8621 "follow-up question"   # a specific thread, by its han
 - Up to a few runs execute concurrently; excess waits on a lock for up to
   `CHATGPT_LOCK_WAIT` seconds (default 3600).
 - `--effort` takes one of the five slider positions `instant`, `medium`,
-  `high`, `extra high`, `pro` (default `pro`). Below `pro` the ChatGPT UI labels
-  the Latest model by effort alone (no version), so those runs are verified as
-  Latest + slider position only.
-- Exit codes: `0` success, `2` model verification failed (nothing sent),
-  `3` response timeout, `4` lock timeout, `5` ChatGPT rate limit.
+  `high`, `extra high`, `pro` (default `pro`, `medium` with `--image`). Below
+  `pro` the model row shows the effort alone, so those runs are verified as the
+  checked GPT-6 entry + slider position.
+- `--image` switches on the composer's image tool (the `+` menu's 이미지 생성 /
+  Create image) after the model is set, and the run stops with exit 2 before
+  sending unless the tool's pill (`picture_v2`) is in the composer. ChatGPT
+  runs such a request as an image job on its own model, not the picked one
+  (measured 2026-10-12: the server filed it under `gpt-5-4-auto-thinking`,
+  thinking effort `standard` at `medium`). The run
+  waits for this run's exchange to finish, checks it on ChatGPT's server as a
+  text reply is checked (its own exchange, no sibling prompt, finished and
+  ended), and downloads every image the image tool filed there. They are saved
+  at `--out PATH` (an existing directory gets a timestamped name inside it;
+  default `~/.chatgpt/out/<timestamp>`), the suffix always following the
+  image's real type (`.png` so far), further images as `-2`, `-3`, … stdout
+  lists the saved paths, one per line, then any text ChatGPT wrote with the
+  image (`--quiet` drops it), then the trailer. A reply without an image is
+  exit 1 with ChatGPT's text in the error (a refusal, or a question to answer
+  with `--continue`). If the server record cannot be read, nothing is saved:
+  the record is what names the images.
+- Exit codes: `0` success, `2` model or image-tool verification failed
+  (nothing sent), `3` response timeout, `4` lock timeout, `5` ChatGPT rate
+  limit.
 - Connectors (GitHub, Drive, …) already authenticated in the ChatGPT account
   are used by simply asking for them in the prompt (e.g. "use the GitHub
   connector to inspect repo X"); the tool never packs or attaches anything
