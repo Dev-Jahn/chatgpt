@@ -22,6 +22,7 @@ import ask_core  # noqa: E402
 
 CONV = "https://chatgpt.com/g/g-p-6a9b861a83d48191ba6b3bd85b197802/c/6a9b8621-0250-83ee-93ed-50f50ee5d7bd"
 TRAILER = ask_core.thread_trailer(CONV)
+IMAGE_TRAILER = ask_core.thread_trailer(CONV, "chatgpt --image")
 
 
 def answer(*_args, **_kwargs):
@@ -141,6 +142,16 @@ class EffortArgTests(unittest.TestCase):
         for bad in ("ultra", "", "  ", "5"):
             with self.assertRaises(ask_core.UsageError):
                 ask_core.parse_args(["--effort", bad, "hi"])
+            with self.assertRaises(ask_core.UsageError):
+                ask_core.parse_args(["--image", "--effort", bad, "hi"])
+
+    def test_image_runs_default_to_medium_and_an_explicit_effort_wins(self):
+        self.assertEqual(ask_core.parse_args(["--image", "a cat"]).effort, "medium")
+        self.assertEqual(ask_core.parse_args(["--image", "--effort", "high", "a cat"]).effort, "high")
+        self.assertEqual(ask_core.parse_args(["--effort", "medium", "--image", "a cat"]).effort, "medium")
+        self.assertEqual(ask_core.parse_args(["--image", "--effort", "pro", "a cat"]).effort, "pro")
+        self.assertEqual(ask_core.parse_args(["a question"]).effort, "pro")
+        self.assertFalse(ask_core.parse_args(["a question"]).image)
 
 
 PROMPT = "GUARD-B2: reply with exactly the word PONG-B2 and nothing else."
@@ -320,21 +331,24 @@ class FakeNode:
 class FakePicker:
     """Just enough of the 2026-09-26 Chat-mode composer to drive select_model: a Chat/Work switch,
     a pill that opens the menu, and a menu whose model row (the view toggle) names the selection,
-    with the model list behind that toggle (view 'advanced') and a tick slider that ignores clicks
-    while the list is showing (measured)."""
+    with the model list behind that toggle (view 'advanced', GPT-6 first since 2026-10) and a tick
+    slider that ignores clicks while the list is showing (measured). `checked` names the checked
+    entry (default: GPT-5.6 Sol when `explicit`, else GPT-6); a name not in the list leaves none
+    checked. At the top tick GPT-6's row reads 'Pro' (measured 2026-10-12); `max_flag` overrides the
+    row's data-maximum flag."""
 
     LABELS = ["Instant", "중간", "High", "매우 높음", "Pro"]
 
     def __init__(
         self, *, mode="chat", explicit=False, value=4, value_max=4, radios=None, picker=True,
-        pro_label="6 Pro",
+        pro_label="Pro", checked=None, max_flag=None,
     ):
-        self.pro_label = pro_label
+        self.pro_label, self.max_flag = pro_label, max_flag
         self.mode = mode
-        self.explicit = explicit
+        self.checked = checked or ("GPT-5.6 Sol" if explicit else "GPT-6")
         self.value = value
         self.value_max = value_max
-        self.radio_names = radios or ["최신", "GPT-5.6 Sol", "GPT-5.5"]
+        self.radio_names = radios or ["GPT-6", "GPT-5.6 Sol", "GPT-5.5"]
         self.picker = picker
         self.menu_open = False
         self.expanded = False
@@ -344,6 +358,10 @@ class FakePicker:
         self.mouse.click.side_effect = self._mouse_click
         self.keyboard = mock.Mock()
         self.keyboard.press.side_effect = self._press
+
+    @property
+    def explicit(self):
+        return not ask_core.MODEL_RE.match(self.checked)
 
     def label(self):
         if self.value == self.value_max:
@@ -361,12 +379,12 @@ class FakePicker:
         if js == ask_core.PICKER_STATE_JS:
             if not (self.menu_open and self.picker):
                 return None
-            checked = "GPT-5.6 Sol" if self.explicit else "최신"
+            checked = self.checked
             return {
                 "view": "advanced" if self.expanded else "simple",
                 "model": checked if checked in self.radio_names else None,
                 "label": self.label(),
-                "max_effort": self.value == self.value_max,
+                "max_effort": self.value == self.value_max if self.max_flag is None else self.max_flag,
                 "value_now": self.value,
                 "value_max": self.value_max,
                 "slider_disabled": self.expanded,
@@ -416,7 +434,7 @@ class FakePicker:
         elif node.kind == "toggle":
             self.expanded = True
         elif node.kind == "radio":
-            self.explicit = not ask_core.LATEST_MODEL_RE.match(node.text)
+            self.checked = node.text
             self.expanded = False
 
 
@@ -433,24 +451,28 @@ class ModelPickerTests(unittest.TestCase):
         page = FakePicker()
         self.assertEqual(FakeNode(page, "pill").inner_text(), "Pro")
         result, log = self.select(page)
-        self.assertEqual(result, "Latest (6 Pro)")
+        self.assertEqual(result, "GPT-6 · Pro")
         self.assertEqual(page.menu_opens, 1)
         self.assertEqual(page.tick_clicks, [])
         self.assertFalse(page.menu_open)
-        self.assertIn("model verified: 6 Pro", log)
+        self.assertIn("model verified: GPT-6 · Pro", log)
 
-    def test_latest_pro_under_another_label_fails_closed(self):
-        """Latest at the top tick that no longer resolves to 6 Pro must not pass as Pro."""
-        page = FakePicker(pro_label="7 Pro")
-        with self.assertRaises(ask_core.ModelVerificationError) as caught:
-            self.select(page)
-        self.assertIn("'7 Pro'", str(caught.exception))
-        self.assertFalse(page.menu_open)
+    def test_a_top_tick_row_that_is_not_plain_pro_at_maximum_fails_closed(self):
+        """The version is pinned by the checked entry; the row must read exactly 'Pro' with its
+        maximum flag set — a row reading '6 Pro' again, or the flag off at the top tick, is drift."""
+        for page, expected in (
+            (FakePicker(pro_label="6 Pro"), "'6 Pro'"),
+            (FakePicker(max_flag=False), "maximum: False"),
+        ):
+            with self.assertRaises(ask_core.ModelVerificationError) as caught:
+                self.select(page)
+            self.assertIn(expected, str(caught.exception))
+            self.assertFalse(page.menu_open)
 
-    def test_explicit_model_is_switched_to_latest_before_the_tick_moves(self):
+    def test_another_model_is_switched_to_gpt6_before_the_tick_moves(self):
         page = FakePicker(explicit=True, value=2)
         result, _ = self.select(page)
-        self.assertEqual(result, "Latest (6 Pro)")
+        self.assertEqual(result, "GPT-6 · Pro")
         self.assertFalse(page.explicit)
         self.assertEqual(page.value, 4)
         # exactly one tick click, on a reopened menu whose model list is collapsed
@@ -461,29 +483,21 @@ class ModelPickerTests(unittest.TestCase):
         page = FakePicker(mode="work", value=3)
         result, log = self.select(page)
         self.assertEqual(page.mode, "chat")
-        self.assertEqual(result, "Latest (6 Pro)")
+        self.assertEqual(result, "GPT-6 · Pro")
         self.assertIn("Work mode", log)
 
-    def test_lower_effort_verifies_latest_and_tick(self):
+    def test_lower_effort_verifies_the_model_and_tick(self):
         page = FakePicker()
         result, _ = self.select(page, "high")
-        self.assertEqual(result, "Latest (high)")
+        self.assertEqual(result, "GPT-6 · high")
         self.assertEqual(page.value, 2)
         self.assertFalse(page.menu_open)
 
     def test_back_to_pro_from_a_lower_tick(self):
         page = FakePicker(value=2)
         result, _ = self.select(page)
-        self.assertEqual(result, "Latest (6 Pro)")
+        self.assertEqual(result, "GPT-6 · Pro")
         self.assertEqual(page.tick_clicks, [(4, False)])
-
-    def test_changed_pro_label_fails_closed(self):
-        page = FakePicker()
-        with mock.patch.object(ask_core, "REQUIRED_PRO_LABEL", "7 Pro"):
-            with self.assertRaises(ask_core.ModelVerificationError) as caught:
-                self.select(page)
-        self.assertIn("'6 Pro'", str(caught.exception))
-        self.assertFalse(page.menu_open)
 
     def test_work_shaped_picker_is_refused(self):
         page = FakePicker(mode=None, value=3, value_max=5)
@@ -507,11 +521,28 @@ class ModelPickerTests(unittest.TestCase):
         self.assertEqual(page.tick_clicks, [])
         self.assertFalse(page.menu_open)
 
-    def test_menu_without_latest_entry_fails_closed(self):
+    def test_menu_without_a_gpt6_entry_fails_closed(self):
         page = FakePicker(explicit=True, radios=["GPT-5.6 Sol", "GPT-5.5"])
         with self.assertRaises(ask_core.ModelVerificationError) as caught:
             self.select(page)
         self.assertIn("GPT-5.5", str(caught.exception))
+        self.assertEqual(page.tick_clicks, [])
+
+    def test_a_newer_model_at_the_top_is_not_taken_for_gpt6(self):
+        """The checked entry pins the version: a GPT-7 listed first must stop the run (exit 2) until
+        the pin is moved, not pass as the pinned model."""
+        page = FakePicker(radios=["GPT-7", "GPT-6.5"], checked="GPT-7")
+        with self.assertRaises(ask_core.ModelVerificationError) as caught:
+            self.select(page)
+        self.assertIn("no GPT-6 entry", str(caught.exception))
+        self.assertEqual(page.tick_clicks, [])
+
+    def test_a_list_with_the_old_latest_entry_fails_closed(self):
+        """Latest names no version, so the pre-2026-10 list (최신 checked, no GPT-6 entry) is refused."""
+        page = FakePicker(radios=["최신", "GPT-5.6 Sol", "GPT-5.5"], checked="최신")
+        with self.assertRaises(ask_core.ModelVerificationError) as caught:
+            self.select(page, "medium")
+        self.assertIn("no GPT-6 entry", str(caught.exception))
         self.assertEqual(page.tick_clicks, [])
 
 
@@ -852,8 +883,9 @@ class ContinuationFlowTests(unittest.TestCase):
         """A page reloaded during a Pro reply can show 'Thinking' without the stop button; measured
         2026-09-28 on a scratch thread, the server then reports async_status 3 with the user turn or
         a 'thoughts' message as the leaf."""
-        for leaf in (RUNNING, RUNNING[:3]):
-            message, put_text, click_send = self.follow_up(streaming=False, server=conversation(*leaf, async_status=3))
+        image_job_running = JOB_EXCHANGE[:-2] + [("g-tool", "g-turn", "tool", "x-g", {**JOB_FINAL, "job": "in_progress"}), JOB_EXCHANGE[-1]]
+        for leaf, status in ((RUNNING, 3), (RUNNING[:3], 3), (image_job_running, 4)):
+            message, put_text, click_send = self.follow_up(streaming=False, server=conversation(*leaf, async_status=status))
             self.assertEqual(message, ask_core.REPLY_RUNNING)
             put_text.assert_not_called()
             click_send.assert_not_called()
@@ -867,6 +899,7 @@ class ContinuationFlowTests(unittest.TestCase):
             "stopped": conversation(*STOPPED),
             "unanswered prompt further up": conversation(*JOINED),
             "flag on an ended leaf": conversation(*FINISHED, async_status=3),
+            "finished image job": conversation(*JOB_EXCHANGE, async_status=4),  # measured 2026-10-12
         }
         for name, server in free.items():
             self.assertFalse(ask_core.server_reply_running(server), name)
@@ -933,32 +966,37 @@ class FakeConversation:
         return None
 
 
+def harvest(page, *, on_tick=lambda n: None, wait=600, turn="b2-turn", read=ask_core.read_text_reply):
+    """wait_for_response on a clock that time.sleep advances; `on_tick(n)` runs at the n-th sleep."""
+    import itertools
+
+    clock, ticks = [0.0], itertools.count(1)
+
+    def sleep(secs):
+        clock[0] += secs
+        on_tick(next(ticks))
+
+    with mock.patch.multiple(
+        ask_core,
+        current_url=mock.Mock(return_value=CONV),
+        is_streaming=mock.Mock(return_value=False),
+        raise_if_rate_limited=mock.Mock(),
+        detect_quota=mock.Mock(return_value=None),
+        log=mock.Mock(),
+    ), mock.patch.object(ask_core.time, "sleep", side_effect=sleep), mock.patch.object(
+        ask_core.time, "monotonic", side_effect=lambda: clock[0]
+    ):
+        return ask_core.wait_for_response(page, CONV, turn, wait, read)
+
+
 class HarvestBindingTests(unittest.TestCase):
     """2026-09-28, run b2: queued behind a2's submit lock, b2 opened the conversation seconds after
     a2's send, on a page that showed neither a2's turn nor the stop button. Its send forked a sibling
     branch, a2's answer appeared on b2's page with ids b2 had never seen, and b2 returned it as its
     own with rc 0."""
 
-    def harvest(self, page, *, on_tick=lambda n: None, wait=600):
-        import itertools
-
-        clock, ticks = [0.0], itertools.count(1)
-
-        def sleep(secs):
-            clock[0] += secs
-            on_tick(next(ticks))
-
-        with mock.patch.multiple(
-            ask_core,
-            current_url=mock.Mock(return_value=CONV),
-            is_streaming=mock.Mock(return_value=False),
-            raise_if_rate_limited=mock.Mock(),
-            detect_quota=mock.Mock(return_value=None),
-            log=mock.Mock(),
-        ), mock.patch.object(ask_core.time, "sleep", side_effect=sleep), mock.patch.object(
-            ask_core.time, "monotonic", side_effect=lambda: clock[0]
-        ):
-            return ask_core.wait_for_response(page, CONV, "b2-turn", wait)
+    def harvest(self, page, **kwargs):
+        return harvest(page, **kwargs)
 
     def b2_page(self, own_done):
         return FakeConversation(
@@ -1225,6 +1263,357 @@ class HarvestBindingTests(unittest.TestCase):
             self.assertEqual((code, stdout.getvalue()), (1, ""))
             self.assertIn("another prompt's exchange", stderr.getvalue())
             self.assertFalse(output.exists())
+
+
+# --- image mode ---------------------------------------------------------------------------
+TOOL_ROWS = (  # the composer add menu's 'chatgpt-primary' rows, measured 2026-10-12
+    "사진 및 파일 추가\n컴퓨터에서 업로드",
+    "라이브러리에서 가져오기\n파일을 둘러보고 검색하세요",
+    "이미지 생성\n무엇이든 시각화하세요",
+    "웹 검색\n실시간 뉴스 및 정보를 찾아보세요",
+    "심층 리서치\n상세 보고서 받기",
+)
+
+
+class FakeComposer:
+    """The 2026-10-12 composer around its image tool: the add button opens an inline overlay of
+    text-only tool rows; picking 이미지 생성 puts the picture_v2 pill in the editor. `pill_takes`
+    False: picking leaves no pill; `stays_open`: the overlay outlives the pick until Escape."""
+
+    def __init__(self, rows=TOOL_ROWS, *, button=True, pill_takes=True, stays_open=False, pill=False):
+        self.rows, self.button, self.pill_takes, self.stays_open = rows, button, pill_takes, stays_open
+        self.open, self.pill, self.picked = False, pill, []
+        self.keyboard = mock.Mock()
+        self.keyboard.press.side_effect = lambda key: setattr(self, "open", False) if key == "Escape" else None
+
+    def query_selector(self, selector):
+        if selector == ask_core.IMAGE_PILL_SELECTOR:
+            return object() if self.pill else None
+        if selector == ask_core.ADD_CONTEXT_SELECTOR and self.button:
+            return FakeComposerButton(self, None)
+        return None
+
+    def query_selector_all(self, selector):
+        if selector == ask_core.TOOL_ROW_SELECTOR and self.open:
+            return [FakeComposerButton(self, text) for text in self.rows]
+        return []
+
+
+class FakeComposerButton:
+    def __init__(self, page, text):
+        self.page, self.text = page, text
+
+    def evaluate(self, js):
+        assert js == ask_core.ROW_NAME_JS
+        return self.text.split("\n")[0]
+
+    def get_attribute(self, name):
+        return ("true" if self.page.open else "false") if name == "aria-expanded" else None
+
+    def click(self, timeout=None):
+        if self.text is None:  # the add button
+            self.page.open = True
+            return
+        self.page.picked.append(self.text.split("\n")[0])
+        self.page.open = self.page.stays_open
+        if self.page.pill_takes and ask_core.IMAGE_TOOL_RE.match(self.text.split("\n")[0]):
+            self.page.pill = True
+
+
+class ImageToolTests(unittest.TestCase):
+    def enable(self, page):
+        with mock.patch.object(ask_core.time, "sleep"), mock.patch.object(ask_core, "log"):
+            ask_core.enable_image_tool(page)
+
+    def test_the_image_row_is_picked_and_its_pill_confirmed(self):
+        page = FakeComposer()
+        self.enable(page)
+        self.assertEqual((page.picked, page.pill, page.open), (["이미지 생성"], True, False))
+        page.keyboard.press.assert_not_called()  # nothing left open: the pill is never risked
+        english = FakeComposer(rows=("Add photos & files\nUpload from computer", "Create image\nVisualize anything"))
+        self.enable(english)
+        self.assertEqual(english.picked, ["Create image"])
+
+    def test_an_overlay_left_open_is_closed_and_the_pill_rechecked(self):
+        page = FakeComposer(stays_open=True)
+        self.enable(page)
+        page.keyboard.press.assert_called_once_with("Escape")
+        self.assertTrue(page.pill)
+
+    def test_a_tool_already_on_is_left_alone(self):
+        page = FakeComposer(pill=True)
+        self.enable(page)
+        self.assertEqual(page.picked, [])
+
+    def test_every_missing_piece_fails_closed_before_anything_is_sent(self):
+        cases = {
+            "add button is missing": FakeComposer(button=False),
+            "no image row": FakeComposer(rows=TOOL_ROWS[:2] + TOOL_ROWS[3:]),
+            "shows no image pill": FakeComposer(pill_takes=False),
+        }
+        for expected, page in cases.items():
+            with self.assertRaises(ask_core.ModelVerificationError, msg=expected) as caught:
+                self.enable(page)
+            self.assertIn(expected, str(caught.exception))
+            self.assertFalse(page.open, expected)
+            if expected == "no image row":
+                self.assertIn("'웹 검색'", str(caught.exception))  # what the menu offered instead
+
+    def test_the_composer_text_check_reads_the_editor_without_its_pills(self):
+        page = mock.Mock()
+        page.evaluate.return_value = "a red fox"
+        self.assertTrue(ask_core.composer_has_prompt(page, "a red fox"))
+        js, arg = page.evaluate.call_args[0]
+        self.assertEqual((js, arg), (ask_core.COMPOSER_TEXT_JS, [ask_core.INPUT_SELECTORS, ask_core.INLINE_PILL_SELECTOR]))
+
+
+IMG = {"pointer": "sediment://file_0000000041b08207a1a9827f80719d75", "mime": "image/png", "size": 3, "width": 1111, "height": 1415}
+IMG2 = {**IMG, "pointer": "sediment://file_00000000aaaa", "size": 4}
+IMAGE_PROMPT = "A watercolor fox reading a newspaper in a Seoul cafe"
+# Shaped like the finished image exchange measured 2026-10-12: the model's call to the image tool,
+# the tool's image message, and an empty final answer that ends the turn.
+IMAGE_EXCHANGE = EARLIER + [
+    ("i-turn", "e-final", "user", "x-i", {"text": IMAGE_PROMPT}),
+    ("i-call", "i-turn", "assistant", "x-i"),
+    ("i-tool", "i-call", "tool", "x-i", {"images": [IMG]}),
+    ("i-final", "i-tool", "assistant", "x-i", FINAL),
+]
+# Shaped like this bridge's first live --image send (2026-10-12, last-exchange read): the pill turns
+# into an '@이미지 생성' prefix, the image tool's message hangs right under the turn with its async job
+# 'final', and a reasoning recap that does not end the turn is the leaf; async_status is 4.
+JOB_FINAL = {"images": [IMG], "job": "final"}
+JOB_EXCHANGE = EARLIER + [
+    ("g-turn", "e-final", "user", "x-g", {"text": f"@이미지 생성 {IMAGE_PROMPT}"}),
+    ("g-tool", "g-turn", "tool", "x-g", JOB_FINAL),
+    ("g-recap", "g-tool", "assistant", "x-g"),
+]
+# The same exchange as the whole tree holds it (measured 2026-10-12): below the job's tool message sit
+# hidden messages — a copy of the image without the job status, the recap's parent — and, after the
+# recap, an answer that ends the turn.
+JOB_TREE = JOB_EXCHANGE[:-1] + [
+    ("g-copy", "g-tool", "tool", "x-g", {"images": [IMG]}),
+    ("g-hidden", "g-copy", "tool", "x-g"),
+    ("g-recap", "g-hidden", "assistant", "x-g"),
+    ("g-end", "g-recap", "assistant", "x-g", FINAL),
+]
+
+
+class FakeImageExchange:
+    """An exchange wrapper as read_image_reply sees it: its assistant bar's state, the ids of its
+    reply units, and an optional ':assistant' text unit."""
+
+    def __init__(self, ids=("i-tool",), done=True, answer=None):
+        self.ids, self.done, self.answer = list(ids), done, answer
+
+    def evaluate(self, js):
+        if js == ask_core.IMAGE_EXCHANGE_DONE_JS:
+            return self.done
+        assert js == ask_core.EXCHANGE_REPLY_IDS_JS
+        return self.ids
+
+    def query_selector_all(self, selector):
+        return [self.answer] if self.answer and selector == ask_core.ASSISTANT_MSG_SELECTORS[0] else []
+
+
+class ImageHarvestTests(unittest.TestCase):
+    def test_an_image_exchange_is_done_without_a_text_unit_or_a_copy_button(self):
+        with mock.patch.object(ask_core, "is_streaming", return_value=False):
+            self.assertEqual(ask_core.read_image_reply(None, FakeImageExchange()), ("", {"i-tool"}))
+            self.assertIsNone(ask_core.read_image_reply(None, FakeImageExchange(done=False)))
+            self.assertIsNone(ask_core.read_image_reply(None, FakeImageExchange(ids=())))
+            captioned = FakeImageExchange(ids=("i-tool", "i-final"), answer=FakeAnswer("i-final", "Here is your fox."))
+            self.assertEqual(ask_core.read_image_reply(None, captioned), ("Here is your fox.", {"i-tool", "i-final"}))
+        with mock.patch.object(ask_core, "is_streaming", return_value=True):
+            self.assertIsNone(ask_core.read_image_reply(None, FakeImageExchange()))
+
+    def test_the_harvest_loop_waits_for_this_runs_image_exchange_to_settle(self):
+        page = FakeConversation({"e-turn": FakeExchange(FakeAnswer("e-final", "earlier"), done=True), "i-turn": FakeImageExchange(done=False)})
+
+        def finish(tick):
+            if tick == 10:
+                page.exchanges["i-turn"].done = True
+
+        self.assertEqual(harvest(page, on_tick=finish, turn="i-turn", read=ask_core.read_image_reply), ("", {"i-tool"}))
+
+    def verify(self, server, reply_ids=("i-tool",), prompt=IMAGE_PROMPT, turn="i-turn"):
+        page = mock.Mock()
+        page.evaluate.side_effect = server if callable(server) else (lambda *_: server)
+        with server_clock() as (self.sleeps, self.log):
+            return ask_core.verify_image_exchange(page, CONV, turn, set(reply_ids), prompt)
+
+    def verify_job(self, server):
+        return self.verify(server, reply_ids=("g-tool",), turn="g-turn")
+
+    def test_an_image_job_that_no_answer_ends_passes_once_its_job_is_final(self):
+        for server in (
+            window(conversation(*JOB_EXCHANGE, async_status=4), "g-turn"),  # the last-exchange read
+            conversation(*JOB_TREE, async_status=4),  # the whole tree
+        ):
+            self.assertEqual(self.verify_job(server), [IMG])
+            self.assertEqual(self.sleeps, [])
+
+    def test_an_image_job_not_yet_final_is_waited_for_then_refused(self):
+        def job(tool):
+            return conversation(*JOB_EXCHANGE[:-2], ("g-tool", "g-turn", "tool", "x-g", tool), JOB_EXCHANGE[-1], async_status=4)
+
+        late = iter([job({**JOB_FINAL, "job": None}), conversation(*JOB_EXCHANGE, async_status=4)])
+        self.assertEqual(self.verify_job(lambda *_: next(late)), [IMG])
+        self.assertEqual(len(self.sleeps), 1)
+        for tool in ({**JOB_FINAL, "job": None}, {**JOB_FINAL, "job": "in_progress"}, {**JOB_FINAL, "status": "in_progress"}):
+            with self.assertRaises(RuntimeError) as caught:
+                self.verify_job(job(tool))
+            self.assertNotIsInstance(caught.exception, ask_core.ForeignReplyError)
+            self.assertIn("not finished on the server", str(caught.exception))
+
+    def test_an_image_job_exchange_that_branches_is_refused(self):
+        forked = conversation(*JOB_EXCHANGE, ("g-other", "g-turn", "assistant", "x-g"), current="g-recap")
+        with self.assertRaises(ask_core.ForeignReplyError) as caught:
+            self.verify_job(forked)
+        self.assertIn("branches on the server (leaves g-other, g-recap)", str(caught.exception))
+
+    def test_the_images_of_this_runs_exchange_are_returned_in_branch_order(self):
+        self.assertEqual(self.verify(conversation(*IMAGE_EXCHANGE)), [IMG])
+        two = conversation(*IMAGE_EXCHANGE[:-1], ("i-tool2", "i-tool", "tool", "x-i", {"images": [IMG2]}), ("i-final", "i-tool2", "assistant", "x-i", FINAL))
+        self.assertEqual(self.verify(two, reply_ids=("i-tool", "i-tool2")), [IMG, IMG2])
+        # The light read lists the last exchange in branch order; one read is enough.
+        self.assertEqual(self.verify(window(conversation(*IMAGE_EXCHANGE), "i-turn")), [IMG])
+        self.assertEqual(self.sleeps, [])
+
+    def test_an_exchange_that_ended_without_an_image_returns_none(self):
+        textual = conversation(*EARLIER, ("i-turn", "e-final", "user", "x-i", {"text": IMAGE_PROMPT}), ("i-final", "i-turn", "assistant", "x-i", FINAL))
+        self.assertEqual(self.verify(textual, reply_ids=("i-final",)), [])
+
+    def test_the_race_shapes_are_refused(self):
+        a2 = ("a2-turn", "e-final", "user", "x-a2", {"text": OTHER_PROMPT})
+        with self.assertRaises(ask_core.ForeignReplyError) as caught:
+            self.verify(conversation(*IMAGE_EXCHANGE, a2), reply_ids=("i-tool",))
+        self.assertIn("sibling branch", str(caught.exception))
+        with self.assertRaises(ask_core.ForeignReplyError) as caught:
+            self.verify(conversation(*IMAGE_EXCHANGE), reply_ids=("i-tool", "e-final"))
+        self.assertIn("not in this prompt's exchange", str(caught.exception))
+        with self.assertRaises(ask_core.ForeignReplyError):
+            self.verify(conversation(*IMAGE_EXCHANGE), prompt=OTHER_PROMPT)
+
+    def test_an_unfinished_image_exchange_is_waited_for_then_refused(self):
+        unfinished = conversation(*IMAGE_EXCHANGE[:-2], ("i-tool", "i-call", "tool", "x-i", {"images": [IMG], "status": "in_progress"}))
+        late = iter([unfinished, conversation(*IMAGE_EXCHANGE)])
+        self.assertEqual(self.verify(lambda *_: next(late)), [IMG])
+        self.assertEqual(len(self.sleeps), 1)
+        with self.assertRaises(RuntimeError) as caught:
+            self.verify(unfinished)
+        self.assertNotIsInstance(caught.exception, ask_core.ServerUnreadableError)
+        self.assertIn("not finished on the server: i-tool", str(caught.exception))
+
+    def download(self, *answers, image=IMG):
+        page = mock.Mock()
+        found = iter(answers)
+        page.evaluate.side_effect = lambda js, arg: next(found)
+        with server_clock() as (self.sleeps, _):
+            result = ask_core.download_image(page, CONV, image)
+        self.assertEqual(page.evaluate.call_args[0][1], {"cid": "6a9b8621-0250-83ee-93ed-50f50ee5d7bd", "fid": "file_0000000041b08207a1a9827f80719d75"})
+        return result
+
+    def test_download_returns_the_bytes_with_the_suffix_of_their_type(self):
+        png = {"type": "image/png", "data": "UE5H"}  # b"PNG"
+        self.assertEqual(self.download(png), ask_core.Image(b"PNG", ".png"))
+        self.assertEqual(self.download({**png, "type": "image/webp"}), ask_core.Image(b"PNG", ".webp"))
+        self.assertEqual(self.download({**BUSY, "retry_after": "7"}, png), ask_core.Image(b"PNG", ".png"))
+        self.assertEqual(self.sleeps, [7.0])
+
+    def test_a_download_that_is_not_the_servers_image_fails(self):
+        png = {"type": "image/png", "data": "UE5H"}
+        for answers, expected in (
+            (({"type": "text/html", "data": "UE5H"},), "not an image"),
+            (({"type": "image/png", "data": "UE5HRw=="},), "is 4 bytes, the server lists 3"),
+            (({"error": "HTTP 404"}, png), "HTTP 404"),
+        ):
+            with self.assertRaises(RuntimeError, msg=expected) as caught:
+                self.download(*answers)
+            self.assertIn(expected, str(caught.exception))
+            self.assertIn(CONV, str(caught.exception))
+
+    def test_image_paths_follow_the_real_type_and_number_the_rest(self):
+        base = Path("/tmp/x/fox.jpg")
+        with mock.patch.object(ask_core, "log") as log:
+            self.assertEqual(ask_core.image_paths(base, [".png", ".png"]), [Path("/tmp/x/fox.png"), Path("/tmp/x/fox-2.png")])
+        log.assert_called_once()
+        self.assertEqual(ask_core.image_paths(Path("/tmp/x/fox"), [".png"]), [Path("/tmp/x/fox.png")])
+        self.assertEqual(ask_core.image_paths(Path("/tmp/x/fox.png"), [".png", ".webp", ".png"]),
+                         [Path("/tmp/x/fox.png"), Path("/tmp/x/fox-2.webp"), Path("/tmp/x/fox-3.png")])
+        with tempfile.TemporaryDirectory() as directory:
+            inside = ask_core.image_base(Path(directory))
+            self.assertEqual(inside.parent, Path(directory).resolve())
+            self.assertEqual(ask_core.image_base(Path(directory) / "fox.png"), (Path(directory) / "fox.png").resolve())
+
+    def run_image(self, argv, *, server=None, pill_stays=True, body="", reply_ids=("i-tool",)):
+        """main() in image mode through the real _ask with the browser mocked: the page answers the
+        server read with the image exchange and the download with three PNG bytes."""
+        page = mock.Mock()
+        answers = {
+            ask_core.SERVER_CONVERSATION_JS: lambda: server or conversation(*IMAGE_EXCHANGE),
+            ask_core.DOWNLOAD_IMAGE_JS: lambda: {"type": "image/png", "data": "UE5H"},
+        }
+        page.evaluate.side_effect = lambda js, *_: answers[js]() if js in answers else CONV
+        with thread_state(), mock.patch.object(ask_core, "sync_playwright", return_value=mock.MagicMock()), mock.patch.multiple(
+            ask_core,
+            port_open=mock.Mock(return_value=True),
+            cdp_browser_ok=mock.Mock(return_value=True),
+            ensure_page_target=mock.Mock(),
+            pick_context=mock.Mock(return_value=mock.Mock(new_page=mock.Mock(return_value=page))),
+            _guard_dialogs=mock.Mock(),
+            login_state=mock.Mock(return_value="ok"),
+            raise_if_rate_limited=mock.Mock(),
+            enter_project=mock.Mock(return_value=True),
+            select_model=mock.Mock(),
+            enable_image_tool=mock.Mock(),
+            image_tool_on=mock.Mock(return_value=pill_stays),
+            message_ids=mock.Mock(return_value=set()),
+            put_text=mock.Mock(),
+            composer_has_prompt=mock.Mock(return_value=True),
+            click_send=mock.Mock(),
+            confirm_sent_and_capture=mock.Mock(return_value=(CONV, "i-turn")),
+            release_submit_lock=mock.Mock(),
+            current_url=mock.Mock(return_value=CONV),
+            wait_for_response=mock.Mock(return_value=(body, set(reply_ids))),
+        ), server_clock(), tempfile.TemporaryDirectory() as directory:
+            directory = str(Path(directory).resolve())
+            argv = [a.replace("{dir}", directory) for a in argv]
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = ask_core.main(argv, stdin=io.StringIO())
+            files = {path.name: path.read_bytes() for path in Path(directory).iterdir()}
+            calls = {name: getattr(ask_core, name) for name in ("select_model", "enable_image_tool", "click_send", "wait_for_response")}
+            return code, stdout.getvalue().replace(directory, "{dir}"), stderr.getvalue(), files, calls
+
+    def test_an_image_run_saves_the_image_and_prints_its_path_then_the_trailer(self):
+        code, stdout, _, files, calls = self.run_image(["--image", "--out", "{dir}/fox.png", IMAGE_PROMPT])
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, f"{{dir}}/fox.png\n\n{IMAGE_TRAILER}\n")
+        self.assertEqual(files, {"fox.png": b"PNG"})
+        calls["select_model"].assert_called_once_with(mock.ANY, "medium")
+        calls["enable_image_tool"].assert_called_once()
+        self.assertIs(calls["wait_for_response"].call_args[0][4], ask_core.read_image_reply)
+        code, stdout, _, _, _ = self.run_image(["--image", "--out", "{dir}/fox.png", IMAGE_PROMPT], body="Here is your fox.")
+        self.assertEqual(stdout.split("\n")[:3], ["{dir}/fox.png", "", "Here is your fox."])
+        self.assertIn("next `chatgpt --image` call", stdout)
+        code, stdout, _, _, _ = self.run_image(["--image", "--quiet", "--out", "{dir}/fox.png", IMAGE_PROMPT], body="Here is your fox.")
+        self.assertEqual(stdout, f"{{dir}}/fox.png\n\n{IMAGE_TRAILER}\n")
+
+    def test_a_reply_without_an_image_is_exit_1_with_its_text_and_nothing_saved(self):
+        textual = conversation(*EARLIER, ("i-turn", "e-final", "user", "x-i", {"text": IMAGE_PROMPT}), ("i-final", "i-turn", "assistant", "x-i", FINAL))
+        code, stdout, stderr, files, _ = self.run_image(
+            ["--image", "--out", "{dir}/fox.png", IMAGE_PROMPT], server=textual, body="Which style would you like?",
+            reply_ids=("i-final",),
+        )
+        self.assertEqual((code, stdout, files), (1, "", {}))
+        self.assertIn("ChatGPT replied without an image, it answered: Which style would you like?", stderr)
+        self.assertIn(CONV, stderr)
+
+    def test_a_pill_gone_before_the_send_is_exit_2_with_nothing_sent(self):
+        code, stdout, stderr, files, calls = self.run_image(["--image", IMAGE_PROMPT], pill_stays=False)
+        self.assertEqual((code, stdout, files), (2, "", {}))
+        self.assertIn("prompt not sent: image tool", stderr)
+        calls["click_send"].assert_not_called()
 
 
 class ConversationLockTests(unittest.TestCase):

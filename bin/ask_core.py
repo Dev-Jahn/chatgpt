@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Send one neutral prompt through a logged-in ChatGPT browser and harvest Markdown.
+"""Send one neutral prompt through a logged-in ChatGPT browser and harvest Markdown — or, with
+--image, the images ChatGPT's image tool generates for it.
 
-Exit codes: 0 success · 1 generic failure · 2 model verification failed (nothing sent)
+Exit codes: 0 success · 1 generic failure · 2 model or image-tool verification failed (nothing sent)
 · 3 response timeout · 5 ChatGPT rate limit (submit blocked, or harvest blocked after
 the prompt was sent — the message then carries the conversation URL) · 64 usage error.
 The bash wrapper adds 4 for its own lock/slot timeouts."""
@@ -9,6 +10,7 @@ The bash wrapper adds 4 for its own lock/slot timeouts."""
 from __future__ import annotations
 
 import argparse
+import base64
 import fcntl
 import hashlib
 import json
@@ -103,15 +105,16 @@ LOGIN_WALL_SELECTORS = [
 ]
 # Composer model picker — Chat mode, measured live 2026-09-26. The pill (composer button targeting
 # 'reasoning') opens a menu whose [data-model-picker-view] swaps two panels: 'simple' shows the model
-# row (the view toggle, labelled e.g. "6 Pro") above a five-tick power slider; 'advanced' shows the
-# model list (최신/Latest plus explicit versions) and disables the slider. The selected model is the
-# aria-checked entry of that list (present in the DOM in both views); the [data-explicit-model]
-# flag stays "false" with an explicit model selected, so it is not read. The pin is the label that
-# model row shows at max effort with the Latest model — "6 Pro" is GPT-6 Pro today (the closed pill
-# reads just "Pro" since 2026-09, so it no longer carries the version); below Pro, Latest is labelled
-# by effort alone.
-REQUIRED_PRO_LABEL = "6 Pro"
-LATEST_MODEL_RE = re.compile(r"^(최신|latest|auto)$", re.I)
+# row (the view toggle) above a five-tick power slider; 'advanced' shows the model list and disables
+# the slider. The selected model is the aria-checked entry of that list (present in the DOM in both
+# views); the [data-explicit-model] flag stays "false" with an explicit model selected, so it is not
+# read. Since 2026-10-12 the list reads GPT-6 · GPT-5.6 Sol · GPT-5.5 with no 최신/Latest entry, and
+# the version is in the entry name: the row reads "Pro" at the top tick (it was "6 Pro" with Latest
+# until 2026-10) and the effort alone below it. So the checked entry pins the version, and the row
+# label plus its data-maximum flag pin Pro.
+REQUIRED_PRO_LABEL = "Pro"
+MODEL_RE = re.compile(r"^gpt-6$", re.I)
+MODEL_NAME = "GPT-6"
 EFFORT_LEVELS = ("instant", "medium", "high", "extra high", "pro")  # slider ticks 0..4
 PILL_SELECTOR = f'{COMPOSER_FORM_SELECTOR} button[aria-haspopup="menu"][data-composer-navigation-target="reasoning"]'
 # Chat/Work switch in the page header: two aria-pressed buttons in a role=group. The buttons carry
@@ -123,6 +126,26 @@ PICKER_SELECTOR = '[role="menu"] [data-model-picker-view]'
 MODEL_TOGGLE_SELECTOR = f'{PICKER_SELECTOR} [role="menuitem"][data-model-picker-view-toggle]'
 MODEL_RADIO_SELECTOR = f'{PICKER_SELECTOR} [role="menuitemradio"]'
 EFFORT_TICK_SELECTOR = f"{PICKER_SELECTOR} [data-model-picker-power-slider] span[data-selected]"
+# Composer image tool — measured live 2026-10-12. The add-context button (파일 등 추가) opens an inline
+# overlay, not a role=menu, whose 'chatgpt-primary' section lists tools as buttons that carry no id,
+# only text (이미지 생성 above the sub-line 무엇이든 시각화하세요). Picking it puts a non-editable pill at
+# the start of the editor; the pill's system-hint type is the language-independent proof the tool is on.
+ADD_CONTEXT_SELECTOR = f'{COMPOSER_FORM_SELECTOR} button[data-composer-navigation-target="add-context"]'
+TOOL_ROW_SELECTOR = (
+    '[data-composer-overlay-floating-ui] [data-mention-section-id="chatgpt-primary"] button[data-list-navigation-item]'
+)
+IMAGE_TOOL_RE = re.compile(r"^(이미지 생성|create image|create an image|image)$", re.I)
+# A row's name: its first visible text (the title span, before the sub-line); its icon is aria-hidden
+# and carries a <style>. innerText would join title and sub-line whenever the layout puts no break.
+ROW_NAME_JS = """row => { const walk = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+  for (let node = walk.nextNode(); node; node = walk.nextNode()) {
+    const text = node.nodeValue.trim();
+    if (text && !node.parentElement.closest('style, script, [aria-hidden="true"]')) return text;
+  }
+  return ''; }"""
+INLINE_PILL_SELECTOR = "[data-inline-selection-pill]"
+IMAGE_PILL_SELECTOR = f'{COMPOSER_FORM_SELECTOR} {INLINE_PILL_SELECTOR}[data-system-hint-type="picture_v2"]'
+IMAGE_SUFFIXES = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
 QUOTA_HINTS = [
     "usage limit",
     "reached your limit",
@@ -159,7 +182,7 @@ class UsageError(Exception):
 
 
 class ModelVerificationError(Exception):
-    pass
+    """The composer is not set up as required (mode, model, effort, image tool); nothing was sent."""
 
 
 class ResponseTimeoutError(Exception):
@@ -178,9 +201,15 @@ class ForeignReplyError(Exception):
     """The answer shown under this run's prompt is not that prompt's answer."""
 
 
+class Image(NamedTuple):
+    data: bytes
+    suffix: str  # from the content type, e.g. '.png'
+
+
 class Reply(NamedTuple):
     body: str
     conversation_url: str
+    images: tuple[Image, ...] = ()
 
 
 class UsageParser(argparse.ArgumentParser):
@@ -197,14 +226,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("prompt", nargs="?", help="prompt text, or '-' to read stdin")
     parser.add_argument("-f", "--file", type=Path, help="read the prompt from a UTF-8 file")
     parser.add_argument(
+        "--image",
+        action="store_true",
+        help="generate images with ChatGPT's image tool: they are saved and their paths printed",
+    )
+    parser.add_argument(
         "--effort",
-        default="pro",
-        help="reasoning effort: instant, medium, high, extra high, pro (default: pro)",
+        help="reasoning effort: instant, medium, high, extra high, pro (default: pro; medium with --image)",
     )
     parser.add_argument("--attach", type=Path, help="attach one file")
     parser.add_argument("--max-wait", type=int, default=7200, metavar="SEC")
-    parser.add_argument("--out", type=Path, help="response path")
-    parser.add_argument("--quiet", action="store_true", help="print only the response path")
+    parser.add_argument(
+        "--out",
+        type=Path,
+        help="response path (with --image: the first image's path or a directory; the suffix follows the image type)",
+    )
+    parser.add_argument(
+        "--quiet", action="store_true", help="print only the response path (with --image: only the image paths)"
+    )
     parser.add_argument(
         "--project",
         help="ChatGPT project to group the chat under (default: '<folder> · <hash8>' from the cwd)",
@@ -236,7 +275,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         raise UsageError("provide exactly one prompt source: PROMPT, '-', or -f FILE")
     if args.max_wait <= 0:
         raise UsageError("--max-wait must be greater than zero")
-    args.effort = EFFORT_LEVELS[effort_index(args.effort)]
+    default_effort = "medium" if args.image else "pro"
+    args.effort = EFFORT_LEVELS[effort_index(default_effort if args.effort is None else args.effort)]
     if args.project is not None and args.no_project:
         raise UsageError("choose either --project or --no-project, not both")
     if args.project is not None and not args.project.strip():
@@ -265,11 +305,33 @@ def read_prompt(args: argparse.Namespace, stdin: TextIO) -> str:
     return prompt
 
 
+def output_stamp() -> str:
+    return datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
+
+
 def response_path(given: Path | None) -> Path:
     if given is not None:
         return given.expanduser().resolve()
-    stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
-    return (Path.home() / ".chatgpt" / "out" / f"{stamp}.md").resolve()
+    return (Path.home() / ".chatgpt" / "out" / f"{output_stamp()}.md").resolve()
+
+
+def image_base(given: Path | None) -> Path:
+    """Where the first image goes, before its suffix is known: --out as given (an existing directory
+    gets a timestamped name inside it), else a timestamped name in ~/.chatgpt/out."""
+    if given is None:
+        return (Path.home() / ".chatgpt" / "out" / output_stamp()).resolve()
+    given = given.expanduser().resolve()
+    return given / output_stamp() if given.is_dir() else given
+
+
+def image_paths(base: Path, suffixes: Sequence[str]) -> list[Path]:
+    """The first image at `base`, the next ones at <stem>-2, <stem>-3, … beside it; each suffix is the
+    image's real one, replacing whatever suffix `base` carries."""
+    stem = base.with_suffix("") if base.suffix else base
+    paths = [stem.with_name(stem.name + (f"-{n}" if n > 1 else "") + suffix) for n, suffix in enumerate(suffixes, 1)]
+    if base.suffix and paths and paths[0] != base:
+        log(f"saving as {paths[0].name}: ChatGPT returned a {suffixes[0]} image")
+    return paths
 
 
 # --- thread ledger ---------------------------------------------------------------------
@@ -411,13 +473,13 @@ def resolve_thread(args: argparse.Namespace) -> str | None:
     return entry["url"]
 
 
-def thread_trailer(url: str) -> str:
+def thread_trailer(url: str, command: str = "chatgpt") -> str:
     """Printed after every reply so the calling agent learns that it can follow up in-thread."""
     handle = thread_handle(conversation_id(url))
     return (
         "---\n"
         f"Thread {handle} · {url}\n"
-        "Follow-up on this topic? Add `--continue` to the next `chatgpt` call to keep going in this "
+        f"Follow-up on this topic? Add `--continue` to the next `{command}` call to keep going in this "
         f"thread (the most recent one from this folder), or `--resume {handle}` to pick it explicitly. "
         "Omit both to start a fresh chat."
     )
@@ -468,10 +530,13 @@ def unlock_conversation(fd: int) -> None:
     os.close(fd)
 
 
-def atomic_write(path: Path, text: str) -> None:
+def atomic_write(path: Path, data: str | bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(text, encoding="utf-8")
+    if isinstance(data, bytes):
+        tmp.write_bytes(data)
+    else:
+        tmp.write_text(data, encoding="utf-8")
     os.replace(tmp, path)
 
 
@@ -1005,15 +1070,15 @@ def read_picker_state(page) -> dict | None:
         return None
 
 
-def latest_selected(state: dict) -> bool:
-    """True only when exactly one model entry is checked and it is Latest."""
-    return bool(state["model"]) and LATEST_MODEL_RE.match(state["model"]) is not None
+def model_selected(state: dict) -> bool:
+    """True only when exactly one model entry is checked and it is the pinned model (MODEL_RE)."""
+    return bool(state["model"]) and MODEL_RE.match(state["model"]) is not None
 
 
-def choose_latest_model(page) -> None:
-    """Switch the picker to its model list and pick the Latest entry; confirm Latest is the checked
-    entry. Picking returns the menu to its simple view, but callers still close and reopen it
-    before touching the slider (it only answers on an untouched menu)."""
+def choose_model(page) -> None:
+    """Switch the picker to its model list and pick the pinned model's entry; confirm it is the
+    checked entry. Picking returns the menu to its simple view, but callers still close and reopen
+    it before touching the slider (it only answers on an untouched menu)."""
     state = read_picker_state(page)
     if state is None or state["view"] != "advanced":
         toggle = _q(page, [MODEL_TOGGLE_SELECTOR])
@@ -1029,7 +1094,7 @@ def choose_latest_model(page) -> None:
     for radio in radios:
         text = normalize(radio.inner_text())
         seen.append(text)
-        if not LATEST_MODEL_RE.match(text):
+        if not MODEL_RE.match(text):
             continue
         try:
             radio.click(timeout=5000)
@@ -1037,12 +1102,12 @@ def choose_latest_model(page) -> None:
             radio.dispatch_event("click")
         time.sleep(1.3)
         state = read_picker_state(page)
-        if state is None or not latest_selected(state):
+        if state is None or not model_selected(state):
             raise ModelVerificationError(
                 f"clicked {text!r} but the picker reports model {state and state['model']!r}"
             )
         return
-    raise ModelVerificationError(f"no Latest entry in the model list; the menu offers {seen!r}")
+    raise ModelVerificationError(f"no {MODEL_NAME} entry in the model list; the menu offers {seen!r}")
 
 
 def choose_effort_tick(page, target: int) -> dict:
@@ -1078,11 +1143,11 @@ def _reopen_picker(page) -> dict:
 
 
 def select_model(page, effort: str) -> str:
-    """Land the composer on Chat mode · Latest model · the wanted effort tick, verified.
+    """Land the composer on Chat mode · GPT-6 · the wanted effort tick, verified.
 
-    The verdict always comes from the open picker: Latest (no explicit model) at the wanted tick,
-    and at Pro the model row must read exactly REQUIRED_PRO_LABEL. Below Pro the UI shows no
-    model version, so the check there is Latest + tick index."""
+    The verdict always comes from the open picker: the pinned model checked in the model list at the
+    wanted tick, and at Pro the model row must read exactly REQUIRED_PRO_LABEL with its maximum flag
+    set."""
     target = effort_index(effort)
     wanted = EFFORT_LEVELS[target]
     try:
@@ -1114,9 +1179,9 @@ def _select_model(page, target: int, wanted: str) -> str:
         raise ModelVerificationError(
             f"cannot tell the selected model; the model list reads {state['radios']!r}"
         )
-    if not latest_selected(state):
-        log(f"explicit model selected ({state['model']!r}, {state['label']!r}); switching to Latest")
-        choose_latest_model(page)
+    if not model_selected(state):
+        log(f"another model selected ({state['model']!r}, {state['label']!r}); switching to {MODEL_NAME}")
+        choose_model(page)
         state = _reopen_picker(page)  # the slider only answers on an untouched menu
         changed = True
     if state["value_now"] != target:
@@ -1126,23 +1191,65 @@ def _select_model(page, target: int, wanted: str) -> str:
     final = _reopen_picker(page) if changed else state
     close_menu(page)
 
-    if not latest_selected(final) or final["value_now"] != target:
+    if not model_selected(final) or final["value_now"] != target:
         raise ModelVerificationError(
-            f"final check failed: expected Latest at tick {target} ({wanted}), picker reported "
+            f"final check failed: expected {MODEL_NAME} at tick {target} ({wanted}), picker reported "
             f"model={final['model']!r} tick={final['value_now']!r}"
         )
     if wanted == "pro":
-        if final["label"] != REQUIRED_PRO_LABEL:
+        if final["label"] != REQUIRED_PRO_LABEL or final["max_effort"] is not True:
             raise ModelVerificationError(
-                f"required label {REQUIRED_PRO_LABEL!r}, the picker's model row reads {final['label']!r}"
+                f"required a model row reading {REQUIRED_PRO_LABEL!r} at maximum effort, the picker's row reads "
+                f"{final['label']!r} (maximum: {final['max_effort']!r})"
             )
-        log(f"model verified: {REQUIRED_PRO_LABEL} (Latest · Pro)")
-        return f"Latest ({REQUIRED_PRO_LABEL})"
-    log(
-        f"model verified: Latest; effort {wanted} (tick {target}, label {final['label']!r}); "
-        "Latest shows no model version below Pro"
-    )
-    return f"Latest ({wanted})"
+    verified = f"{final['model']} · {REQUIRED_PRO_LABEL if wanted == 'pro' else wanted}"
+    log(f"model verified: {verified} (tick {target}, row {final['label']!r})")
+    return verified
+
+
+def _click(node) -> None:
+    try:
+        node.click(timeout=5000)
+    except Exception:
+        node.dispatch_event("click")
+
+
+def image_tool_on(page) -> bool:
+    return page.query_selector(IMAGE_PILL_SELECTOR) is not None
+
+
+def enable_image_tool(page) -> None:
+    """Turn on the composer's image tool and confirm its pill in the editor. A missing add button,
+    tool row or pill fails closed with ModelVerificationError (exit 2, nothing sent)."""
+    if image_tool_on(page):
+        return
+    button = page.query_selector(ADD_CONTEXT_SELECTOR)
+    if button is None:
+        raise ModelVerificationError("image tool: the composer's add button is missing")
+    _click(button)
+    time.sleep(1.2)
+    seen = []
+    for row in page.query_selector_all(TOOL_ROW_SELECTOR):
+        name = normalize(row.evaluate(ROW_NAME_JS))
+        seen.append(name)
+        if IMAGE_TOOL_RE.match(name):
+            _click(row)
+            break
+    else:
+        if button.get_attribute("aria-expanded") == "true":
+            close_menu(page)
+        raise ModelVerificationError(f"image tool: no image row in the composer's add menu; it offers {seen!r}")
+    for _ in range(10):
+        time.sleep(0.5)
+        if image_tool_on(page):
+            break
+    else:
+        raise ModelVerificationError(f"image tool: picked {name!r} but the composer shows no image pill")
+    if button.get_attribute("aria-expanded") == "true":
+        close_menu(page)
+        if not image_tool_on(page):
+            raise ModelVerificationError("image tool: closing the add menu removed the image pill")
+    log("image tool on (composer pill picture_v2)")
 
 
 def attach_file(page, path: Path) -> None:
@@ -1186,12 +1293,22 @@ def put_text(page, prompt: str) -> None:
     time.sleep(0.5)
 
 
+# The editor's text without its inline selection pills (the image tool's 이미지 생성). innerText needs a
+# rendered node to keep the line breaks between paragraphs, so a pill-free copy is laid out off-screen
+# for the read — the editor itself is never touched.
+COMPOSER_TEXT_JS = f"""([sels, pill]) => {{ const el = ({COMPOSER_EL_JS})(sels);
+  if (!el) return '';
+  if (!el.querySelector(pill)) return el.innerText || el.textContent || '';
+  const copy = el.cloneNode(true);
+  copy.querySelectorAll(pill).forEach(p => p.remove());
+  for (const name of ['id', 'contenteditable', 'role', 'aria-label']) copy.removeAttribute(name);
+  copy.style.cssText = 'position: fixed; left: -100000px; top: 0;';
+  document.body.appendChild(copy);
+  try {{ return copy.innerText || copy.textContent || ''; }} finally {{ copy.remove(); }} }}"""
+
+
 def composer_text(page) -> str:
-    return page.evaluate(
-        f"""sels => {{ const el = ({COMPOSER_EL_JS})(sels);
-            return el ? (el.innerText || el.textContent || '') : ''; }}""",
-        INPUT_SELECTORS,
-    ) or ""
+    return page.evaluate(COMPOSER_TEXT_JS, [INPUT_SELECTORS, INLINE_PILL_SELECTOR]) or ""
 
 
 def composer_has_prompt(page, prompt: str) -> bool:
@@ -1445,19 +1562,64 @@ def exchange_complete(page, exchange) -> bool:
         return False
 
 
+# Measured 2026-10-12 on a finished image exchange: the generated image sits in a unit keyed only by
+# the image tool's message id (no ':assistant' unit-key; the empty final answer is not rendered), and
+# the assistant bar offers 이미지 복사 / 공유 / 다시 시도 but no plain copy action. So an image exchange
+# is done once nothing streams and that bar holds any button, and its reply ids are those of every
+# unit outside the user's.
+IMAGE_EXCHANGE_DONE_JS = """w => [...w.querySelectorAll(%s)]
+  .filter(bar => !bar.closest(%s))
+  .some(bar => bar.querySelector('button') !== null)""" % tuple(
+    json.dumps(value) for value in (TURN_ACTIONS_SELECTOR, ", ".join(USER_MSG_SELECTORS))
+)
+EXCHANGE_REPLY_IDS_JS = """w => [...w.querySelectorAll(%s)]
+  .filter(unit => !unit.closest(%s))
+  .flatMap(unit => (unit.getAttribute(%s) || '').split(/\\s+/).filter(Boolean))""" % tuple(
+    json.dumps(value) for value in (f"[{MESSAGE_IDS_ATTR}]", ", ".join(USER_MSG_SELECTORS), MESSAGE_IDS_ATTR)
+)
+
+
+def read_text_reply(page, exchange) -> tuple[str, set[str]] | None:
+    """A text exchange's finished answer and its message ids, or None while it is not done."""
+    node = exchange_answer(exchange)
+    if node is None or not exchange_complete(page, exchange):
+        return None
+    text = assistant_markdown(node).strip()
+    return (text, node_message_ids(node)) if text else None
+
+
+def read_image_reply(page, exchange) -> tuple[str, set[str]] | None:
+    """An image exchange's text (often none) and the ids of its reply units, or None while it is not
+    done. Which units hold images is the server's to say (verify_image_exchange)."""
+    if is_streaming(page):
+        return None
+    try:
+        if not exchange.evaluate(IMAGE_EXCHANGE_DONE_JS):
+            return None
+        ids = set(exchange.evaluate(EXCHANGE_REPLY_IDS_JS) or [])
+    except Exception:
+        return None
+    if not ids:
+        return None
+    node = exchange_answer(exchange)
+    return (assistant_markdown(node).strip() if node is not None else ""), ids
+
+
 def wait_for_response(
     page,
     conversation_url: str,
     turn_id: str,
     deadline: float,
+    read: Callable[..., tuple[str, set[str]] | None] = read_text_reply,
 ) -> tuple[str, set[str]]:
-    """The finished answer of this run's own exchange (see own_exchange) and the assistant message ids
-    it was read from. A turn that stays off the page for OWN_TURN_GRACE_SECS fails the harvest: some
-    other exchange's answer is never a substitute."""
+    """The finished reply of this run's own exchange (see own_exchange) as `read` reports it — its
+    text and the message ids it was read from — once that report holds still for STABLE_SECS. A turn
+    that stays off the page for OWN_TURN_GRACE_SECS fails the harvest: some other exchange's answer
+    is never a substitute."""
     key = conversation_key(conversation_url)
     stable_since = None
     missing_since = None
-    previous = ""
+    previous = None
     last_status = -STATUS_INTERVAL
     log(f"waiting for response (up to {max(0, int(deadline - time.monotonic()))}s)")
     while time.monotonic() < deadline:
@@ -1481,8 +1643,8 @@ def wait_for_response(
                 raise RuntimeError(f"this run's turn {turn_id} is no longer on the page")
         else:
             missing_since = None
-        node = exchange_answer(exchange) if exchange is not None else None
-        if node is None or not exchange_complete(page, exchange):
+        reply = read(page, exchange) if exchange is not None else None
+        if reply is None:
             # The prompt is already in flight here: a throttle now blocks only the
             # harvest, so the error must carry the conversation URL for a later pickup.
             raise_if_rate_limited(
@@ -1495,27 +1657,24 @@ def wait_for_response(
             stable_since = None
             time.sleep(2)
             continue
-        current = assistant_markdown(node).strip()
-        if not current:
-            stable_since = None
-            time.sleep(2)
-            continue
-        if normalize(current) != normalize(previous):
+        current = (normalize(reply[0]), sorted(reply[1]))
+        if current != previous:
             previous = current
             stable_since = time.monotonic()
             time.sleep(1)
             continue
         if stable_since is not None and time.monotonic() - stable_since >= STABLE_SECS:
-            log(f"response received: {len(current)} characters")
-            return current, node_message_ids(node)
+            log(f"response received: {len(reply[0])} characters, message ids {', '.join(sorted(reply[1]))}")
+            return reply
         time.sleep(1)
     raise ResponseTimeoutError("response wait timed out")
 
 
 # --- the server's record ---------------------------------------------------------------
 # The conversation as the server keeps it, read with the page's own session token and reduced to
-# each message's parent, role, status, turn_exchange_id and end_turn, the text of user messages, and
-# whether a user message has versions (another prompt answering the same message).
+# each message's parent, role, status, turn_exchange_id and end_turn, the text of user messages,
+# whether a user message has versions (another prompt answering the same message), the generated
+# images other messages carry, and the status of the image job that filed them.
 # Measured 2026-09-28:
 # - Every message of an exchange carries its user turn's turn_exchange_id; the answer the page shows
 #   is the exchange's last message, role assistant, channel 'final', end_turn true (45 messages of
@@ -1551,7 +1710,11 @@ SERVER_CONVERSATION_JS = """async ({cid, turns}) => {
     const response = await fetch(url, {headers: {Authorization: 'Bearer ' + token}});
     if (!response.ok) return {error: 'HTTP ' + response.status, status: response.status, retry_after: response.headers.get('retry-after')};
     const conversation = await response.json();
-    const text = message => ((message.content || {}).parts || []).filter(p => typeof p === 'string').join('\\n');
+    const parts = message => ((message && message.content) || {}).parts || [];
+    const text = message => parts(message).filter(p => typeof p === 'string').join('\\n');
+    const images = message => parts(message)
+      .filter(p => p && p.content_type === 'image_asset_pointer' && typeof p.asset_pointer === 'string')
+      .map(p => ({pointer: p.asset_pointer, mime: p.mime_type || null, size: p.size_bytes ?? null, width: p.width ?? null, height: p.height ?? null}));
     const reduce = (message, parent) => {
       const role = message ? message.author.role : null, metadata = (message && message.metadata) || {};
       return {
@@ -1562,6 +1725,8 @@ SERVER_CONVERSATION_JS = """async ({cid, turns}) => {
         end_turn: message ? message.end_turn === true : false,
         versions: metadata.has_versions === true,
         text: role === 'user' ? text(message) : '',
+        images: role && role !== 'user' ? images(message) : [],
+        job: metadata.ghostrider && typeof metadata.ghostrider.status === 'string' ? metadata.ghostrider.status : null,
       };
     };
     const messages = {};
@@ -1673,13 +1838,48 @@ def prompt_of(messages: dict, message_id: str) -> str | None:
     return None
 
 
+# Measured 2026-10-12 on a send with the image tool on: a system-hint image request runs as an async
+# 'ghostrider' job. Its exchange is the user turn (text '@이미지 생성 …', system_hints picture_v2), the
+# image tool's message carrying the image with metadata.ghostrider.status 'final', and a reasoning
+# recap; no message ends the turn, and the conversation's async_status is 4 afterwards.
+def exchange_ended(messages: dict, path: list[str]) -> bool:
+    """Whether a reply is over, given its messages from the user turn down to its last one: the last
+    is an answer that ended its turn (text replies, model-driven image calls), or — an image job —
+    every message is finished, at least one carries images, and every one that does reports its job
+    final."""
+    if not path:
+        return False
+    last = messages[path[-1]]
+    if last["role"] == "assistant" and last["end_turn"]:
+        return True
+    jobs = [message_id for message_id in path if messages[message_id].get("images")]
+    return (
+        bool(jobs)
+        and all(messages[message_id]["status"] == "finished_successfully" for message_id in path)
+        and all(messages[message_id].get("job") == "final" for message_id in jobs)
+    )
+
+
+def reply_path(messages: dict, end: str, turn_id: str) -> list[str]:
+    """The messages from just below `turn_id` down to `end`, in branch order."""
+    path, node = [], end
+    while node != turn_id:
+        path.append(node)
+        node = messages[node]["parent"]
+    return path[::-1]
+
+
 def server_reply_running(conversation: dict) -> bool:
     """The server is still generating the reply at the conversation's leaf: async_status is set and
-    the leaf is not an answer that ended its turn. Only the leaf counts: an earlier prompt left
-    without an answer further up does not block."""
-    leaf = conversation["messages"].get(conversation.get("current_node") or "")
-    ended = leaf is not None and leaf["role"] == "assistant" and leaf["end_turn"]
-    return conversation.get("async_status") is not None and not ended
+    the leaf's reply has not ended (exchange_ended, over the leaf's exchange back to its user turn).
+    Only the leaf counts: an earlier prompt left without an answer further up does not block."""
+    messages = conversation["messages"]
+    leaf = conversation.get("current_node") or ""
+    path, node = [], leaf
+    while node in messages and messages[node]["role"] not in (None, "user") and messages[node]["exchange"] == messages[leaf]["exchange"]:
+        path.append(node)
+        node = messages[node]["parent"]
+    return conversation.get("async_status") is not None and not exchange_ended(messages, path[::-1])
 
 
 REPLY_RUNNING = "a reply is still in progress in this conversation; nothing sent"
@@ -1714,16 +1914,84 @@ def verify_reply_exchange(page, conversation_url: str, turn_id: str, reply_ids: 
     the other's exchange, and the answer that streamed was left 'in_progress' with no text. So this
     run's turn must have no sibling prompt, and the answer must come from this run's exchange
     (turn_exchange_id), follow this run's turn with no other prompt in between (a prompt sent into
-    a running reply shares its exchange), be finished there and end the turn.
-
-    Reads the last exchange (2.7 MB on the work thread); when this run's messages are not all in it
-    (a later turn, another branch, or a record still being written), the whole tree (13.7 MB; the
-    newest ten turns were 16.8 MB there), which later tries keep reading. When reads
-    keep failing for HARVEST_PATIENCE, ServerUnreadableError; when the record stays incomplete or
-    unfinished for RECORD_PATIENCE, RuntimeError."""
+    a running reply shares its exchange), be finished there and end the turn."""
     if not reply_ids:
         raise RuntimeError(f"the reply carries no message id, so it cannot be checked against this run's turn; see {conversation_url}")
-    ids = [turn_id, *sorted(reply_ids)]
+
+    def judge(messages: dict) -> str | None:
+        _refuse_foreign(messages, turn_id, sorted(reply_ids), prompt, conversation_url)
+        ids = [turn_id, *sorted(reply_ids)]
+        unfinished = [message_id for message_id in ids if messages[message_id]["status"] != "finished_successfully"]
+        if not unfinished and any(messages[message_id]["end_turn"] for message_id in reply_ids):
+            return None
+        return f"not finished on the server: {', '.join(unfinished or sorted(reply_ids))}"
+
+    check_on_server(page, conversation_url, [turn_id, *sorted(reply_ids)], judge)
+
+
+def verify_image_exchange(page, conversation_url: str, turn_id: str, reply_ids: set[str], prompt: str) -> list[dict]:
+    """The generated images of this run's own exchange, as the server files them, in branch order.
+    The same refusals as verify_reply_exchange, shaped for an image exchange (measured 2026-10-12):
+    the page shows only the image tool's message, and the reply's end is on the server — an empty
+    final answer the page does not render (a model-driven image call), or, for an image job that no
+    answer ends, the exchange's only leaf (see exchange_ended). So every message the page shows must
+    belong to this run's exchange; the images are the image parts of the messages on the path from
+    that end back to this run's turn (a user's reference upload is a user message, never among them).
+    An exchange that ended without an image returns []."""
+    if not reply_ids:
+        raise RuntimeError(f"the reply carries no message id, so it cannot be checked against this run's turn; see {conversation_url}")
+    found: list[dict] = []
+
+    def judge(messages: dict) -> str | None:
+        _refuse_foreign_turn(messages, turn_id, prompt, conversation_url)
+        exchange = messages[turn_id]["exchange"]
+        own = [
+            message_id
+            for message_id, message in messages.items()
+            if message_id != turn_id and exchange and message["exchange"] == exchange and prompt_of(messages, message_id) == turn_id
+        ]
+        foreign = sorted(set(reply_ids) - set(own))
+        if foreign:
+            raise ForeignReplyError(
+                "the reply shown under this run's prompt is not in this prompt's exchange on the server "
+                f"(messages {', '.join(foreign)}); nothing returned — see {conversation_url}"
+            )
+        unfinished = [message_id for message_id in [turn_id, *own] if messages[message_id]["status"] != "finished_successfully"]
+        ends = [message_id for message_id in own if messages[message_id]["role"] == "assistant" and messages[message_id]["end_turn"]]
+        if len(ends) > 1:
+            raise ForeignReplyError(
+                f"this run's turn has {len(ends)} finished answers on the server (messages {', '.join(ends)}); "
+                f"nothing returned — see {conversation_url}"
+            )
+        if not ends:
+            ends = [message_id for message_id in own if not any(messages[other]["parent"] == message_id for other in own)]
+            if len(ends) > 1:
+                raise ForeignReplyError(
+                    f"this run's exchange branches on the server (leaves {', '.join(sorted(ends))}); "
+                    f"nothing returned — see {conversation_url}"
+                )
+        path = reply_path(messages, ends[0], turn_id) if ends else []
+        if unfinished or not exchange_ended(messages, path):
+            return f"not finished on the server: {', '.join(unfinished or path or [turn_id])}"
+        unique: dict[str, dict] = {}  # the whole tree repeats a job's image in a hidden copy (measured 2026-10-12)
+        for message_id in path:
+            for image in messages[message_id].get("images") or []:
+                unique.setdefault(image["pointer"], image)
+        found[:] = unique.values()
+        return None
+
+    check_on_server(page, conversation_url, [turn_id, *sorted(reply_ids)], judge)
+    return found
+
+
+def check_on_server(page, conversation_url: str, ids: list[str], judge: Callable[[dict], str | None]) -> None:
+    """The read/wait loop both harvest checks share. Reads the last exchange (2.7 MB on the work
+    thread); when any of `ids` is not in it (a later turn, another branch, or a record still being
+    written), the whole tree (13.7 MB; the newest ten turns were 16.8 MB there), which later tries
+    keep reading. Once they are all there, `judge(messages)` raises on a foreign answer, returns None
+    when the record passes, or names what is still unfinished. When reads keep failing for
+    HARVEST_PATIENCE, ServerUnreadableError; when the record stays incomplete or unfinished for
+    RECORD_PATIENCE, RuntimeError."""
     start = time.monotonic()
     turns: int | None = LAST_EXCHANGE_TURNS
     attempt, problem, unreadable, unfinished_seen = 0, "", False, False
@@ -1743,11 +2011,9 @@ def verify_reply_exchange(page, conversation_url: str, turn_id: str, reply_ids: 
             if missing:
                 problem = f"not on the server yet: {', '.join(missing)}"
             else:
-                _refuse_foreign(messages, turn_id, sorted(reply_ids), prompt, conversation_url)
-                unfinished = [message_id for message_id in ids if messages[message_id]["status"] != "finished_successfully"]
-                if not unfinished and any(messages[message_id]["end_turn"] for message_id in reply_ids):
+                problem = judge(messages)
+                if problem is None:
                     return
-                problem = f"not finished on the server: {', '.join(unfinished or sorted(reply_ids))}"
                 unfinished_seen = True
         deadline = start + (HARVEST_PATIENCE if unreadable else RECORD_PATIENCE)
         if not server_wait(attempt, deadline, problem, retry_after):
@@ -1759,7 +2025,8 @@ def verify_reply_exchange(page, conversation_url: str, turn_id: str, reply_ids: 
     raise RuntimeError(f"{message}; nothing returned — read it at {conversation_url}")
 
 
-def _refuse_foreign(messages: dict, turn_id: str, reply_ids: list[str], prompt: str, conversation_url: str) -> None:
+def _refuse_foreign_turn(messages: dict, turn_id: str, prompt: str, conversation_url: str) -> None:
+    """This run's turn on the server: its prompt, with no sibling prompt answering the same message."""
     user = messages[turn_id]
     if user["role"] != "user" or text_key(prompt)[:PROMPT_KEY_CHARS] not in text_key(user["text"]):
         raise ForeignReplyError(f"the server's message {turn_id} is not this run's prompt; see {conversation_url}")
@@ -1771,7 +2038,11 @@ def _refuse_foreign(messages: dict, turn_id: str, reply_ids: list[str], prompt: 
             "another prompt was sent in reply to the same message as this run's (a sibling branch), and the "
             f"server mixes such answers; nothing returned — see {conversation_url}"
         )
-    exchange = user["exchange"]
+
+
+def _refuse_foreign(messages: dict, turn_id: str, reply_ids: list[str], prompt: str, conversation_url: str) -> None:
+    _refuse_foreign_turn(messages, turn_id, prompt, conversation_url)
+    exchange = messages[turn_id]["exchange"]
     foreign = [
         message_id
         for message_id in reply_ids
@@ -1790,6 +2061,62 @@ def _refuse_foreign(messages: dict, turn_id: str, reply_ids: list[str], prompt: 
         )
 
 
+# --- downloading generated images -------------------------------------------------------
+# Measured 2026-10-12: /backend-api/files/download/<file id>?conversation_id=…&inline=false (bearer
+# token; the file id is the asset pointer after 'sediment://') answers a signed download_url, and a
+# plain fetch of that URL from the page returns the image bytes (image/png, size_bytes exactly). The
+# page's own <img> holds only a blob: URL.
+DOWNLOAD_IMAGE_JS = """async ({cid, fid}) => {
+  const failed = response => ({error: 'HTTP ' + response.status, retry_after: response.headers.get('retry-after')});
+  try {
+    const session = await fetch('/api/auth/session');
+    if (!session.ok) return failed(session);
+    const token = (await session.json()).accessToken;
+    const meta = await fetch('/backend-api/files/download/' + encodeURIComponent(fid) + '?conversation_id=' + encodeURIComponent(cid) + '&inline=false',
+                             {headers: {Authorization: 'Bearer ' + token}});
+    if (!meta.ok) return failed(meta);
+    const url = (await meta.json()).download_url;
+    if (!url) return {error: 'no download_url in the answer'};
+    const file = await fetch(url);
+    if (!file.ok) return failed(file);
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return {type: file.headers.get('content-type'), data: btoa(binary)};
+  } catch (error) {
+    return {error: 'network: ' + String(error).slice(0, 200)};
+  }
+}"""
+
+
+def download_image(page, conversation_url: str, image: dict) -> Image:
+    """One generated image's bytes; a 429 is waited out (server_wait) for HARVEST_PATIENCE, any other
+    failure, a non-image content type or a size other than the server's fails the run."""
+    pointer = image.get("pointer") or ""
+    file_id = pointer.split("://", 1)[1] if "://" in pointer else ""
+    if not file_id:
+        raise RuntimeError(f"unexpected image pointer {pointer!r}; see {conversation_url}")
+    deadline = time.monotonic() + HARVEST_PATIENCE
+    attempt = 0
+    while True:
+        found = page.evaluate(DOWNLOAD_IMAGE_JS, {"cid": conversation_id(conversation_url), "fid": file_id}) or {}
+        problem = found.get("error") or ("" if found.get("data") is not None else "no data in the answer")
+        if not problem:
+            break
+        if problem != "HTTP 429" or not server_wait(attempt, deadline, problem, retry_after_secs(found.get("retry_after"))):
+            raise RuntimeError(f"could not download image {file_id} ({problem}); see {conversation_url}")
+        attempt += 1
+    mime = (found.get("type") or "").split(";")[0].strip().lower()
+    if not mime.startswith("image/"):
+        raise RuntimeError(f"image {file_id} downloaded as {mime or 'no content type'!r}, not an image; see {conversation_url}")
+    data = base64.b64decode(found["data"])
+    if image.get("size") is not None and len(data) != image["size"]:
+        raise RuntimeError(f"image {file_id} is {len(data)} bytes, the server lists {image['size']}; see {conversation_url}")
+    suffix = IMAGE_SUFFIXES.get(mime) or "." + re.sub(r"[^a-z0-9]+", "", mime.split("/", 1)[1])
+    log(f"image downloaded: {file_id} ({mime}, {len(data)} bytes)")
+    return Image(data, suffix)
+
+
 def ask(
     prompt: str,
     *,
@@ -1798,9 +2125,11 @@ def ask(
     max_wait: int,
     project: str | None = None,
     conversation: str | None = None,
+    image: bool = False,
 ) -> Reply:
-    """One prompt, one reply. The conversation lock (lock_conversation) is held from before anything
-    is typed — a follow-up takes it up front, a fresh chat as soon as its URL is known and before the
+    """One prompt, one reply — with `image`, through the composer's image tool, the reply carrying the
+    downloaded images. The conversation lock (lock_conversation) is held from before anything is
+    typed — a follow-up takes it up front, a fresh chat as soon as its URL is known and before the
     submit lock is released — until the reply is harvested or the run gives up."""
     held: list[int] = []
     if conversation:
@@ -1812,7 +2141,7 @@ def ask(
     try:
         return _ask(
             prompt, effort=effort, attach=attach, max_wait=max_wait, project=project,
-            conversation=conversation, held=held,
+            conversation=conversation, image=image, held=held,
         )
     finally:
         for fd in held:
@@ -1827,6 +2156,7 @@ def _ask(
     max_wait: int,
     project: str | None,
     conversation: str | None,
+    image: bool,
     held: list[int],
 ) -> Reply:
     if sync_playwright is None:
@@ -1873,6 +2203,8 @@ def _ask(
                         raise RuntimeError("ChatGPT session unavailable after project fallback")
 
             select_model(page, effort)
+            if image:
+                enable_image_tool(page)
             if attach is not None:
                 attach_file(page, attach)
 
@@ -1882,11 +2214,15 @@ def _ask(
 
             put_text(page, prompt)
             if not composer_has_prompt(page, prompt):
-                clear_composer(page)
+                clear_composer(page)  # takes the image tool's pill with it
+                if image:
+                    enable_image_tool(page)
                 put_text(page, prompt)
                 if not composer_has_prompt(page, prompt):
                     raise RuntimeError("prompt did not enter the composer intact")
             raise_if_rate_limited(page, "rate limited before submit; nothing sent")
+            if image and not image_tool_on(page):
+                raise ModelVerificationError("image tool: the composer's image pill is gone")
             click_send(page)
             conversation_url, turn_id = confirm_sent_and_capture(page, base_ids, prompt, bound_url)
             log(f"thread bound: {thread_handle(conversation_id(conversation_url))} ({conversation_url}); turn {turn_id}")
@@ -1902,9 +2238,10 @@ def _ask(
             release_submit_lock()
             deadline = time.monotonic() + max_wait
 
+            read = read_image_reply if image else read_text_reply
             for attempt in range(2):
                 try:
-                    body, reply_ids = wait_for_response(page, conversation_url, turn_id, deadline)
+                    body, reply_ids = wait_for_response(page, conversation_url, turn_id, deadline, read)
                     break
                 except (ResponseTimeoutError, RateLimitedError):
                     raise  # neither gets better by reloading the page right away
@@ -1920,6 +2257,8 @@ def _ask(
                     _guard_dialogs(context, page)
                     page.goto(conversation_url, wait_until="domcontentloaded", timeout=60000)
                     time.sleep(2)
+            if image:
+                return Reply(body, conversation_url, harvest_images(page, conversation_url, turn_id, reply_ids, prompt, body))
             try:
                 verify_reply_exchange(page, conversation_url, turn_id, reply_ids, prompt)
             except ServerUnreadableError as exc:
@@ -1933,6 +2272,21 @@ def _ask(
                 pass
 
 
+def harvest_images(page, conversation_url: str, turn_id: str, reply_ids: set[str], prompt: str, body: str) -> tuple[Image, ...]:
+    """This run's generated images, checked on the server and downloaded. No image is exit 1 with the
+    reply's text (a refusal or a question back); an unreadable record too, and nothing is saved:
+    without the record there is nothing to download."""
+    try:
+        found = verify_image_exchange(page, conversation_url, turn_id, reply_ids, prompt)
+    except ServerUnreadableError as exc:
+        raise RuntimeError(f"{exc}; nothing saved — see {conversation_url}") from None
+    if not found:
+        said = f"it answered: {prompt_excerpt(body, 300)}" if body.strip() else "and no text"
+        raise RuntimeError(f"ChatGPT replied without an image, {said} — see {conversation_url}")
+    log(f"reply checked on the server: {len(found)} image(s) in the exchange of turn {turn_id}")
+    return tuple(download_image(page, conversation_url, item) for item in found)
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -1944,7 +2298,7 @@ def main(
         prompt = read_prompt(args, stdin or sys.stdin)
         if args.attach is not None and not args.attach.expanduser().is_file():
             raise UsageError(f"attachment is not a file: {args.attach}")
-        output = response_path(args.out)
+        output = image_base(args.out) if args.image else response_path(args.out)
         conversation = resolve_thread(args)
         project = None
         if not args.no_project and conversation is None:
@@ -1956,20 +2310,32 @@ def main(
             max_wait=args.max_wait,
             project=project,
             conversation=conversation,
+            image=args.image,
         )
         body = reply.body.strip()
-        if not body:
-            raise RuntimeError("harvested response is empty")
-        atomic_write(output, body + "\n")  # the saved file is the pure response
-        print(output if args.quiet else body)
+        if args.image:
+            if not reply.images:
+                raise RuntimeError("harvested reply has no image")
+            paths = image_paths(output, [item.suffix for item in reply.images])
+            for path, item in zip(paths, reply.images):
+                atomic_write(path, item.data)
+            print("\n".join(str(path) for path in paths))
+            if body and not args.quiet:
+                print()
+                print(body)
+        else:
+            if not body:
+                raise RuntimeError("harvested response is empty")
+            atomic_write(output, body + "\n")  # the saved file is the pure response
+            print(output if args.quiet else body)
         print()
-        print(thread_trailer(reply.conversation_url))
+        print(thread_trailer(reply.conversation_url, "chatgpt --image" if args.image else "chatgpt"))
         return 0
     except UsageError as exc:
         print(f"chatgpt: {exc}", file=sys.stderr)
         return 64
     except ModelVerificationError as exc:
-        print(f"chatgpt: model verification failed; prompt not sent: {exc}", file=sys.stderr)
+        print(f"chatgpt: verification failed; prompt not sent: {exc}", file=sys.stderr)
         return 2
     except ResponseTimeoutError as exc:
         print(f"chatgpt: {exc}", file=sys.stderr)
